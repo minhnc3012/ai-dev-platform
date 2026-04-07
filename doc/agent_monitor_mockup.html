@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Monitor — AI Dev Platform</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f4ef;
+    color: #1a1a18;
+    padding: 24px;
+    min-height: 100vh;
+  }
+
+  .app {
+    background: #f5f4ef;
+    max-width: 860px;
+    margin: 0 auto;
+  }
+
+  /* Topbar */
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+  }
+  .topbar-title { font-size: 15px; font-weight: 500; color: #1a1a18; }
+  .badge-row { display: flex; gap: 6px; }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-weight: 500;
+  }
+  .badge-running { background: #E6F1FB; color: #0C447C; }
+  .badge-done    { background: #EAF3DE; color: #27500A; }
+  .badge-wait    { background: #FAEEDA; color: #633806; }
+  .badge-error   { background: #FCEBEB; color: #791F1F; }
+  .badge-idle    { background: #F1EFE8; color: #5F5E5A; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 2px; margin-bottom: 14px; border-bottom: 1px solid #e2e0d8; }
+  .tab {
+    font-size: 13px;
+    padding: 7px 16px;
+    border-radius: 6px 6px 0 0;
+    cursor: pointer;
+    color: #5F5E5A;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    transition: color .15s, border-color .15s;
+  }
+  .tab.active {
+    color: #1a1a18;
+    font-weight: 500;
+    border-bottom: 2px solid #534AB7;
+  }
+  .tab:hover:not(.active) { color: #1a1a18; background: #eeede8; }
+
+  /* Tab panels */
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* Agent rows */
+  .agent-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    background: #ffffff;
+    border: 0.5px solid #e2e0d8;
+    border-radius: 8px;
+    margin-bottom: 6px;
+  }
+  .pulse {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .pulse-blue   { background: #378ADD; }
+  .pulse-green  { background: #639922; }
+  .pulse-amber  { background: #BA7517; }
+  .pulse-gray   { background: #B4B2A9; }
+  .pulse-red    { background: #E24B4A; }
+
+  .agent-name  { font-size: 13px; font-weight: 500; width: 120px; flex-shrink: 0; }
+  .agent-task  { font-size: 12px; color: #73726c; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .agent-time  { font-size: 11px; color: #a09e96; font-family: monospace; min-width: 48px; text-align: right; }
+
+  .progress-wrap { margin: -4px 0 8px 134px; }
+  .progress-bar  { height: 4px; background: #e2e0d8; border-radius: 2px; }
+  .progress-fill { height: 4px; border-radius: 2px; transition: width .4s; }
+  .fill-blue  { background: #378ADD; }
+  .fill-green { background: #639922; }
+
+  /* Log panel */
+  .log-area {
+    background: #141414;
+    border-radius: 8px;
+    padding: 14px 16px;
+    font-family: "Fira Code", "Cascadia Code", "Consolas", monospace;
+    font-size: 12px;
+    line-height: 1.9;
+    overflow-y: auto;
+    max-height: 260px;
+    border: 0.5px solid #2a2a28;
+  }
+  .log-ts     { color: #4a4a48; }
+  .log-agent  { color: #7F77DD; }
+  .log-info   { color: #9FE1CB; }
+  .log-warn   { color: #FAC775; }
+  .log-done   { color: #97C459; }
+  .log-think  { color: #85B7EB; }
+
+  /* Report card */
+  .report-card {
+    background: #ffffff;
+    border: 0.5px solid #e2e0d8;
+    border-radius: 12px;
+    padding: 16px 18px;
+    margin-top: 4px;
+  }
+  .report-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .report-agent-name { font-size: 15px; font-weight: 500; }
+  .confidence-row { display: flex; align-items: center; gap: 8px; }
+  .confidence-bar-wrap { width: 120px; height: 6px; background: #e2e0d8; border-radius: 3px; }
+  .confidence-fill { height: 6px; border-radius: 3px; background: #639922; }
+  .confidence-pct { font-size: 12px; font-weight: 500; color: #27500A; }
+
+  .report-summary { font-size: 13px; color: #3d3d3a; line-height: 1.6; margin-bottom: 14px; }
+
+  .report-section-label {
+    font-size: 11px;
+    font-weight: 500;
+    color: #73726c;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    margin-bottom: 7px;
+  }
+
+  .deliverable {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 12px;
+    color: #1a1a18;
+    padding: 5px 0;
+    border-bottom: 0.5px solid #f0efe9;
+  }
+  .deliverable:last-child { border-bottom: none; }
+  .di-icon {
+    width: 14px; height: 14px;
+    border-radius: 3px;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .di-doc  { background: #E6F1FB; }
+  .di-code { background: #EEEDFE; }
+  .di-test { background: #E1F5EE; }
+
+  .decision-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 12px;
+    color: #1a1a18;
+    padding: 5px 0;
+    border-bottom: 0.5px solid #f0efe9;
+    border-left: 3px solid #BA7517;
+    padding-left: 10px;
+    margin-bottom: 4px;
+    border-radius: 0 4px 4px 0;
+    background: #fdf8f0;
+  }
+  .decision-item:last-child { border-bottom: none; }
+
+  /* Section divider */
+  .section-gap { margin-bottom: 14px; }
+
+  /* Approve / Reject */
+  .approval-row { display: flex; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 0.5px solid #e2e0d8; }
+  .btn {
+    padding: 6px 18px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    border: 1px solid;
+    transition: opacity .15s;
+  }
+  .btn:hover { opacity: .82; }
+  .btn-approve { background: #EAF3DE; color: #27500A; border-color: #97C459; }
+  .btn-reject  { background: transparent; color: #791F1F; border-color: #F09595; }
+
+  @media (prefers-color-scheme: dark) {
+    body { background: #1c1c1a; color: #d4d2c8; }
+    .app { background: #1c1c1a; }
+    .topbar-title { color: #d4d2c8; }
+    .tab { color: #73726c; }
+    .tab.active { color: #d4d2c8; border-bottom-color: #7F77DD; }
+    .tab:hover:not(.active) { background: #2a2a28; color: #d4d2c8; }
+    .agent-row { background: #252523; border-color: #333330; }
+    .agent-name { color: #d4d2c8; }
+    .progress-bar { background: #333330; }
+    .report-card { background: #252523; border-color: #333330; }
+    .report-summary { color: #b0ae a6; }
+    .deliverable { color: #d4d2c8; border-bottom-color: #2e2e2c; }
+    .decision-item { background: #2d2819; border-left-color: #EF9F27; color: #d4d2c8; border-bottom-color: #2e2e2c; }
+    .approval-row { border-top-color: #333330; }
+    .tabs { border-bottom-color: #333330; }
+    .badge-idle { background: #2a2a28; color: #73726c; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Topbar -->
+  <div class="topbar">
+    <span class="topbar-title">Module: User Authentication</span>
+    <div class="badge-row">
+      <span class="badge badge-running">3 running</span>
+      <span class="badge badge-done">1 done</span>
+      <span class="badge badge-wait">1 waiting</span>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('monitor', this)">Agent monitor</button>
+    <button class="tab" onclick="switchTab('log', this)">Event log</button>
+    <button class="tab" onclick="switchTab('report', this)">Report</button>
+  </div>
+
+  <!-- Panel: Monitor -->
+  <div id="panel-monitor" class="panel active">
+
+    <div class="agent-row">
+      <span class="pulse pulse-green"></span>
+      <span class="agent-name">PM Agent</span>
+      <span class="badge badge-done">Done</span>
+      <span class="agent-task">Created 8 user stories, 3 acceptance criteria</span>
+      <span class="agent-time">1m 24s</span>
+    </div>
+
+    <div class="agent-row">
+      <span class="pulse pulse-blue"></span>
+      <span class="agent-name">Architect</span>
+      <span class="badge badge-running">Running</span>
+      <span class="agent-task">Designing DB schema: users, sessions, refresh_tokens...</span>
+      <span class="agent-time">0m 47s</span>
+    </div>
+    <div class="progress-wrap">
+      <div class="progress-bar"><div class="progress-fill fill-blue" style="width:62%"></div></div>
+    </div>
+
+    <div class="agent-row">
+      <span class="pulse pulse-blue"></span>
+      <span class="agent-name">Dev Agent</span>
+      <span class="badge badge-running">Running</span>
+      <span class="agent-task">Writing AuthService.java — method validateToken()</span>
+      <span class="agent-time">2m 11s</span>
+    </div>
+    <div class="progress-wrap">
+      <div class="progress-bar"><div class="progress-fill fill-blue" style="width:38%"></div></div>
+    </div>
+
+    <div class="agent-row">
+      <span class="pulse pulse-amber"></span>
+      <span class="agent-name">QA Agent</span>
+      <span class="badge badge-wait">Waiting</span>
+      <span class="agent-task">Waiting for Dev Agent to complete before testing</span>
+      <span class="agent-time">—</span>
+    </div>
+
+    <div class="agent-row">
+      <span class="pulse pulse-blue"></span>
+      <span class="agent-name">Docs Agent</span>
+      <span class="badge badge-running">Running</span>
+      <span class="agent-task">Writing API documentation for /auth/login endpoint</span>
+      <span class="agent-time">0m 33s</span>
+    </div>
+
+  </div>
+
+  <!-- Panel: Event Log -->
+  <div id="panel-log" class="panel">
+    <div class="log-area" id="log-output">
+      <div><span class="log-ts">14:22:01</span> <span class="log-agent">[PM]</span> <span class="log-done">✓ Completed — 8 user stories generated</span></div>
+      <div><span class="log-ts">14:22:03</span> <span class="log-agent">[Architect]</span> <span class="log-info">Analysing requirement context...</span></div>
+      <div><span class="log-ts">14:22:18</span> <span class="log-agent">[Architect]</span> <span class="log-think">Thinking: JWT vs session-based auth trade-offs...</span></div>
+      <div><span class="log-ts">14:22:31</span> <span class="log-agent">[Dev]</span> <span class="log-info">Starting code generation — AuthController.java</span></div>
+      <div><span class="log-ts">14:22:45</span> <span class="log-agent">[Dev]</span> <span class="log-warn">⚠ Missing: refresh token expiry config — using default 7d</span></div>
+      <div><span class="log-ts">14:22:47</span> <span class="log-agent">[Docs]</span> <span class="log-info">Generating OpenAPI spec for auth endpoints</span></div>
+      <div><span class="log-ts">14:23:02</span> <span class="log-agent">[Architect]</span> <span class="log-info">Writing schema: CREATE TABLE users, sessions...</span></div>
+      <div><span class="log-ts">14:23:14</span> <span class="log-agent">[Dev]</span> <span class="log-think">Thinking: Best approach for token rotation strategy...</span></div>
+      <div><span class="log-ts">14:23:19</span> <span class="log-agent">[Docs]</span> <span class="log-info">Writing /auth/logout endpoint documentation</span></div>
+    </div>
+    <div style="margin-top:8px; display:flex; gap:8px;">
+      <button class="btn btn-approve" onclick="addLogLine()">Simulate event ↓</button>
+    </div>
+  </div>
+
+  <!-- Panel: Report -->
+  <div id="panel-report" class="panel">
+    <div class="report-card">
+
+      <div class="report-header">
+        <span class="report-agent-name">PM Agent — report</span>
+        <div class="confidence-row">
+          <div class="confidence-bar-wrap">
+            <div class="confidence-fill" style="width:87%"></div>
+          </div>
+          <span class="confidence-pct">87%</span>
+        </div>
+      </div>
+
+      <p class="report-summary">
+        Analysed authentication module requirements. Produced 8 user stories and 23 acceptance criteria.
+        Requirement is clear and detailed enough for implementation. One open question regarding MFA scope.
+      </p>
+
+      <div class="section-gap">
+        <p class="report-section-label">Deliverables</p>
+        <div class="deliverable">
+          <div class="di-icon di-doc"></div>
+          <span>user_stories.md — 8 stories, 23 acceptance criteria</span>
+        </div>
+        <div class="deliverable">
+          <div class="di-icon di-doc"></div>
+          <span>auth_flow_diagram.md — login, logout, token refresh flows</span>
+        </div>
+      </div>
+
+      <div class="section-gap">
+        <p class="report-section-label">Owner decisions needed</p>
+        <div class="decision-item">
+          Is Multi-Factor Authentication (MFA) required? — affects DB schema and implementation scope
+        </div>
+        <div class="decision-item">
+          Refresh token expiry: 1 hour or 24 hours? — affects security vs. UX trade-off
+        </div>
+      </div>
+
+      <div class="section-gap">
+        <p class="report-section-label">Confidence reason</p>
+        <p style="font-size:12px;color:#73726c;line-height:1.6;">
+          Requirement is clear and tech stack is familiar. Gap: MFA scope and session strategy are undefined.
+        </p>
+      </div>
+
+      <div class="approval-row">
+        <button class="btn btn-approve" onclick="handleApprove()">Approve — run Architect next</button>
+        <button class="btn btn-reject" onclick="handleReject()">Reject</button>
+      </div>
+
+    </div>
+  </div>
+
+</div>
+
+<script>
+  function switchTab(name, el) {
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.getElementById('panel-' + name).classList.add('active');
+    el.classList.add('active');
+  }
+
+  const extraLogs = [
+    ['14:23:28', 'Architect', 'log-done', '✓ DB schema completed — 4 tables created'],
+    ['14:23:29', 'Architect', 'log-done', '✓ API contract written — 6 endpoints defined'],
+    ['14:23:31', 'Dev', 'log-info', 'Writing JwtTokenProvider.java...'],
+    ['14:23:44', 'Dev', 'log-think', 'Thinking: Use RS256 or HS256 for JWT signing?'],
+    ['14:23:50', 'QA', 'log-info', 'Dev completed — starting test plan...'],
+    ['14:24:01', 'QA', 'log-warn', '⚠ Edge case: token reuse after logout not covered'],
+    ['14:24:09', 'QA', 'log-done', '✓ 12 test cases written'],
+    ['14:24:15', 'Docs', 'log-done', '✓ API documentation complete — 6 endpoints documented'],
+  ];
+  let logIdx = 0;
+
+  function addLogLine() {
+    if (logIdx >= extraLogs.length) { logIdx = 0; }
+    const [ts, agent, cls, msg] = extraLogs[logIdx++];
+    const line = document.createElement('div');
+    line.innerHTML = `<span class="log-ts">${ts}</span> <span class="log-agent">[${agent}]</span> <span class="${cls}">${msg}</span>`;
+    const logEl = document.getElementById('log-output');
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function handleApprove() {
+    const btn = event.target;
+    btn.textContent = '✓ Approved — Architect Agent starting...';
+    btn.style.background = '#EAF3DE';
+    btn.disabled = true;
+    setTimeout(() => {
+      switchTab('monitor', document.querySelector('.tab'));
+    }, 1200);
+  }
+
+  function handleReject() {
+    const card = event.target.closest('.report-card');
+    const row = card.querySelector('.approval-row');
+    row.innerHTML = '<span style="font-size:13px;color:#791F1F;font-weight:500;">Run rejected — pipeline paused. Edit requirement and re-trigger.</span>';
+  }
+</script>
+</body>
+</html>

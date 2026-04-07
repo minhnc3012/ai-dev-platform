@@ -1,0 +1,86 @@
+spring:
+  application:
+    name: ai-dev-platform
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5434}/aidevplatform
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:admin}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+        jdbc:
+          time_zone: UTC
+          lob:
+            non_contextual_binding: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+
+  # Enable async execution for AgentOrchestrator
+  task:
+    execution:
+      pool:
+        core-size: 4
+        max-size: 16
+        queue-capacity: 50
+
+vaadin:
+  launch-browser: false
+  allowed-packages: com.aidevplatform
+
+# File storage — set type=local to store on disk (no MinIO needed), type=minio to use MinIO
+storage:
+  type: ${STORAGE_TYPE:local}
+  upload-dir: ${UPLOAD_DIR:./uploads}
+
+# MinIO file storage (only used when storage.type=minio)
+minio:
+  endpoint: ${MINIO_ENDPOINT:http://localhost:9000}
+  access-key: ${MINIO_ACCESS_KEY:minioadmin}
+  secret-key: ${MINIO_SECRET_KEY:minioadmin}
+  bucket-name: aidevplatform
+
+# Agent Python service
+agent:
+  service-url: ${AGENT_SERVICE_URL:http://localhost:8001}
+  internal-api-key: ${AGENT_API_KEY:dev-secret}
+
+server:
+  port: ${SERVER_PORT:8080}
+
+logging:
+  level:
+    com.aidevplatform: INFO
+    org.springframework.data.redis: WARN
+    org.springframework.security: DEBUG
+
+# Agent Memory & Summarization Configuration
+ai:
+  summarization:
+    model: ${SUMMARIZATION_MODEL:gpt-4o}
+    api-key: ${SUMMARIZATION_API_KEY:}
+    base-url: ${SUMMARIZATION_BASE_URL:}
+    system-prompt: |
+      You are an expert AI assistant that summarizes chat conversations.
+      Provide a concise summary of what was accomplished and any important decisions made.
+      Focus on: 1) What was accomplished, 2) Key decisions and why, 3) Important context for next agent.
+      Be concise but comprehensive.

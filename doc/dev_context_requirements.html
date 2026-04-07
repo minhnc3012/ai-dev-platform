@@ -1,0 +1,115 @@
+
+<style>
+.section { margin-bottom: 18px; }
+.sec-head { font-size: 11px; font-weight: 500; color: var(--color-text-secondary); text-transform: uppercase; letter-spacing: .06em; margin: 0 0 8px; border-bottom: 0.5px solid var(--color-border-tertiary); padding-bottom: 6px; }
+.item-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; }
+.item { background: var(--color-background-secondary); border-radius: var(--border-radius-md); padding: 10px 12px; }
+.item-title { font-size: 13px; font-weight: 500; color: var(--color-text-primary); margin: 0 0 3px; }
+.item-body { font-size: 12px; color: var(--color-text-secondary); margin: 0; line-height: 1.55; }
+.pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; margin-bottom: 5px; }
+.pill-must { background: #FAECE7; color: #712B13; }
+.pill-good { background: #E1F5EE; color: #085041; }
+.flow-row { display: flex; align-items: center; gap: 0; margin-bottom: 6px; }
+.flow-step { background: var(--color-background-primary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-md); padding: 6px 12px; font-size: 12px; color: var(--color-text-primary); white-space: nowrap; }
+.flow-arrow { font-size: 14px; color: var(--color-text-tertiary); padding: 0 6px; }
+</style>
+
+<div class="section">
+<p class="sec-head">1 — Thông tin dev phải có trước khi agent chạy</p>
+<div class="item-grid">
+  <div class="item">
+    <span class="pill pill-must">Bắt buộc</span>
+    <p class="item-title">Tech stack cụ thể</p>
+    <p class="item-body">Java version, Spring Boot version, DB engine, frontend framework, build tool. Agent cần biết chính xác để generate code đúng.</p>
+  </div>
+  <div class="item">
+    <span class="pill pill-must">Bắt buộc</span>
+    <p class="item-title">Project structure</p>
+    <p class="item-body">Package naming convention, folder layout, layer structure (controller/service/repo). Agent cần đặt file đúng chỗ.</p>
+  </div>
+  <div class="item">
+    <span class="pill pill-must">Bắt buộc</span>
+    <p class="item-title">Existing code patterns</p>
+    <p class="item-body">Upload 2–3 file mẫu (BaseEntity, BaseController, ErrorHandler) để agent học style và follow đúng convention.</p>
+  </div>
+  <div class="item">
+    <span class="pill pill-must">Bắt buộc</span>
+    <p class="item-title">Dependencies đang dùng</p>
+    <p class="item-body">pom.xml / build.gradle hiện tại. Agent biết dùng lib gì đang có, không suggest lib mới không cần thiết.</p>
+  </div>
+  <div class="item">
+    <span class="pill pill-good">Rất nên có</span>
+    <p class="item-title">ERD / DB schema hiện có</p>
+    <p class="item-body">Architect agent dùng để thiết kế phần mới tương thích, tránh duplicate table hay naming conflict.</p>
+  </div>
+  <div class="item">
+    <span class="pill pill-good">Rất nên có</span>
+    <p class="item-title">API naming convention</p>
+    <p class="item-body">REST endpoint pattern: /api/v1/{resource}, response format chuẩn (ApiResponse wrapper), error code scheme.</p>
+  </div>
+</div>
+</div>
+
+<div class="section">
+<p class="sec-head">2 — Format report agent nên gửi về khi hoàn thành task</p>
+<div class="item-grid">
+  <div class="item">
+    <p class="item-title">Summary (cho owner)</p>
+    <p class="item-body">1–3 câu tóm tắt: đã làm gì, kết quả gì. Không technical jargon. Ví dụ: "Đã tạo API login/logout với JWT, test coverage 87%".</p>
+  </div>
+  <div class="item">
+    <p class="item-title">Deliverables list</p>
+    <p class="item-body">Danh sách file/output cụ thể: tên file, loại (code/doc/test), đường dẫn, kích thước/dòng code. Có thể download.</p>
+  </div>
+  <div class="item">
+    <p class="item-title">Issues &amp; blockers</p>
+    <p class="item-body">Những điểm agent không chắc hoặc cần quyết định của con người. Phân loại: blocking (phải giải quyết trước) vs non-blocking.</p>
+  </div>
+  <div class="item">
+    <p class="item-title">Confidence score</p>
+    <p class="item-body">0–100% kèm lý do. Thấp vì: requirement mơ hồ / thiếu context / có nhiều cách giải quyết. Giúp owner biết cần review kỹ đâu.</p>
+  </div>
+  <div class="item">
+    <p class="item-title">Next steps</p>
+    <p class="item-body">Gợi ý bước tiếp theo: "QA Agent có thể bắt đầu", "Cần owner confirm token expiry", "Architect nên review schema trước".</p>
+  </div>
+  <div class="item">
+    <p class="item-title">Token &amp; time usage</p>
+    <p class="item-body">Tokens consumed, thời gian chạy, số lần retry. Owner theo dõi cost và identify chỗ nào agent đang "looping".</p>
+  </div>
+</div>
+</div>
+
+<div class="section">
+<p class="sec-head">3 — Workflow trạng thái module từ requirement đến done</p>
+<div style="overflow-x:auto;">
+<div class="flow-row">
+  <div class="flow-step" style="background:#FAECE7;border-color:#F5C4B3;">Raw upload</div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-step" style="background:#EEEDFE;border-color:#CECBF6;">PM parsing</div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-step" style="background:#EEEDFE;border-color:#CECBF6;">Owner review</div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-step" style="background:#E6F1FB;border-color:#B5D4F4;">Architect design</div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-step" style="background:#E1F5EE;border-color:#9FE1CB;">Dev coding</div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-step" style="background:#FAECE7;border-color:#F5C4B3;">QA testing</div>
+  <span class="flow-arrow">→</span>
+  <div class="flow-step" style="background:#EAF3DE;border-color:#C0DD97;">Completed</div>
+</div>
+</div>
+<p style="font-size:12px;color:var(--color-text-secondary);margin:8px 0 0;">Mỗi bước agent set status trên module → Vaadin UI highlight màu tương ứng → Owner thấy ngay đang ở đâu.</p>
+</div>
+
+<div class="section" style="margin-bottom:0">
+<p class="sec-head">4 — Vaadin views cần implement</p>
+<div class="item-grid">
+  <div class="item"><p class="item-title">Project Dashboard</p><p class="item-body">List projects, status tổng quan, quick actions: new project, view modules.</p></div>
+  <div class="item"><p class="item-title">Project Settings</p><p class="item-body">Form nhập AI config: LLM, tech stack, coding style, active agents, approval mode.</p></div>
+  <div class="item"><p class="item-title">Module Manager</p><p class="item-body">List modules, upload requirement (drag &amp; drop), trigger agent run, view status.</p></div>
+  <div class="item"><p class="item-title">Agent Monitor</p><p class="item-body">Real-time view: agent status, live log stream qua SSE, progress bars.</p></div>
+  <div class="item"><p class="item-title">Report Viewer</p><p class="item-body">Xem report từng agent, deliverables list, download files, approve/reject output.</p></div>
+  <div class="item"><p class="item-title">Dev Context Panel</p><p class="item-body">Upload code mẫu, ERD, convention docs. Agent dùng làm context khi generate.</p></div>
+</div>
+</div>
