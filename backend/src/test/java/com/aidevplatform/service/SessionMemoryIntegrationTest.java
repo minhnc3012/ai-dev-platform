@@ -13,6 +13,7 @@ import com.aidevplatform.repository.AgentRunRepository;
 import com.aidevplatform.repository.AgentSessionRepository;
 import com.aidevplatform.repository.ModuleRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -224,8 +225,11 @@ public class SessionMemoryIntegrationTest {
         Module module = createTestModule();
         AgentRun run = createAndSaveRun(module, "pm", AgentRunStatus.COMPLETED);
 
+        ObjectNode factsNode = objectMapper.createObjectNode();
+        factsNode.set("deliverables", objectMapper.valueToTree(List.of(Map.of("name", "requirements"))));
+
         SessionCompressorService.ResumptionContext context = new SessionCompressorService.ResumptionContext(
-                Map.of("deliverables", List.of(Map.of("name", "requirements"))),
+                factsNode,
                 "PM completed scope definition",
                 "Chose REST over GraphQL for simplicity",
                 "Last user message"
@@ -235,7 +239,7 @@ public class SessionMemoryIntegrationTest {
         String prompt = context.toSystemPrompt("dev", objectMapper);
 
         // Then: Includes all sections
-        assertThat(prompt).contains("## Current Agent: dev");
+        assertThat(prompt).contains("## Agent: dev");
         assertThat(prompt).contains("## Completed Work (Structured Facts)");
         assertThat(prompt).contains("## Session Summary");
         assertThat(prompt).contains("## Design Decisions");

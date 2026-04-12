@@ -23,7 +23,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from crew_runner import run_agent_pipeline
-from event_publisher import push_event, fetch_interrupted_runs
+from event_publisher import push_event, fetch_interrupted_runs, complete_run
+from agent_state import AgentState, recover_stuck_runs, SignalConsumer
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
@@ -131,14 +132,16 @@ def _recover_interrupted_runs() -> None:
     On startup, fetch all runs that were RUNNING when the service last crashed
     and re-execute each one in a background thread.
 
-    Runs that are already claimed (e.g., received via Redis channel before this
-    method runs) are skipped via the _active_runs deduplication set.
+    Also recovers runs that completed but backend didn't acknowledge,
+    ensuring workflow continuity across service restarts.
     """
+    # First, use the new state-based recovery
+    recovered = recover_stuck_runs()
+
     print("[main] Checking for interrupted runs to recover...")
     interrupted = fetch_interrupted_runs()
     if not interrupted:
-        print("[main] No interrupted runs found.")
-        return
+        print("[main] No interrupted runs found via backend API.")
 
     print(f"[main] Recovering {len(interrupted)} interrupted run(s)...")
     for task_config in interrupted:
@@ -172,6 +175,10 @@ def main() -> None:
         print(f"[main] FATAL: Cannot connect to Redis: {exc}")
         sys.exit(1)
 
+    # Initialize signal consumer for RESUME/APPROVE/REJECT signals
+    signal_consumer = SignalConsumer(redis_client=r)
+    signal_consumer.start()
+
     # Subscribe FIRST so we don't miss any tasks dispatched during recovery window
     pubsub = r.pubsub()
     pubsub.subscribe(**{
@@ -198,6 +205,7 @@ def main() -> None:
     finally:
         pubsub.unsubscribe()
         pubsub.close()
+        signal_consumer.on_shutdown()
         print("[main] Agent service stopped.")
 
 

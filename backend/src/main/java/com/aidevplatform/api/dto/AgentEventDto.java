@@ -3,8 +3,8 @@ package com.aidevplatform.api.dto;
 import lombok.Builder;
 import lombok.Data;
 
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.time.LocalDateTime;
-import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -19,6 +19,6 @@ public class AgentEventDto {
     private String eventType;
     private String message;
     private String severity;
-    private Map<String, Object> payload;
+    private ObjectNode payload;
     private LocalDateTime timestamp;
 }

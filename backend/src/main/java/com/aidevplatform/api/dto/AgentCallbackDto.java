@@ -1,5 +1,6 @@
 package com.aidevplatform.api.dto;
 
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.Data;
 
 import java.util.UUID;
@@ -11,6 +12,6 @@ import java.util.UUID;
 @Data
 public class AgentCallbackDto {
     private UUID runId;
-    private AgentReportDto report;
+    private ObjectNode report;
     private Integer tokensUsed;
 }

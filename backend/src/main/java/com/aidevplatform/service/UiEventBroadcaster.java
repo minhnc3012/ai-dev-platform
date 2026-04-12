@@ -52,19 +52,28 @@ public class UiEventBroadcaster {
 
     /**
      * Broadcasts an agent event to all UI listeners watching the event's module.
-     * Called from SseService (background thread) — uses UI.access() for safety.
+     * Called from background threads — uses UI.access() for thread safety.
+     *
+     * Detached UIs (browser tab closed, session expired) are removed automatically
+     * so the listener map stays clean and access() is never called on dead sessions.
      */
     public void broadcast(AgentEventDto event, UUID moduleId) {
         listeners.forEach((regId, entry) -> {
-            if (entry.moduleId().equals(moduleId)) {
-                entry.ui().access(() -> {
-                    try {
-                        entry.consumer().accept(event);
-                    } catch (Exception e) {
-                        log.warn("UI event consumer threw exception: regId={}", regId, e);
-                    }
-                });
+            if (!entry.moduleId().equals(moduleId)) return;
+
+            if (!entry.ui().isAttached()) {
+                log.debug("Removing stale UI listener (UI detached): regId={}", regId);
+                listeners.remove(regId);
+                return;
             }
+
+            entry.ui().access(() -> {
+                try {
+                    entry.consumer().accept(event);
+                } catch (Exception e) {
+                    log.warn("UI event consumer threw exception: regId={}", regId, e);
+                }
+            });
         });
     }
 

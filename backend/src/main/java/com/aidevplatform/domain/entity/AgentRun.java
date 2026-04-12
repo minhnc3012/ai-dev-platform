@@ -3,7 +3,6 @@ package com.aidevplatform.domain.entity;
 import com.aidevplatform.domain.enums.AgentRunStatus;
 import jakarta.persistence.*;
 import lombok.*;
-import org.springframework.data.annotation.LastModifiedDate;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -40,10 +39,6 @@ public class AgentRun extends BaseEntity {
     private Integer tokensUsed = 0;
     private Integer retryCount = 0;
     private String errorMessage;
-
-    @Column(name = "updated_at")
-    @LastModifiedDate
-    private LocalDateTime updatedAt;
 
     @OneToMany(mappedBy = "run", cascade = CascadeType.ALL)
     @OrderBy("createdAt ASC")

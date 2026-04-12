@@ -7,7 +7,7 @@ import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 import lombok.*;
 
-import java.util.Map;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 @Entity
 @Table(name = "agent_events")
@@ -32,7 +32,7 @@ public class AgentEvent extends BaseEntity {
 
     @Column(columnDefinition = "jsonb")
     @JdbcTypeCode(SqlTypes.JSON)
-    private Map<String, Object> payload;
+    private ObjectNode payload;
 
     @Enumerated(EnumType.STRING)
     private EventSeverity severity = EventSeverity.INFO;

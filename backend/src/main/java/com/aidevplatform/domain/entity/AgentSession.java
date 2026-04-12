@@ -1,5 +1,6 @@
 package com.aidevplatform.domain.entity;
 
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.Serializable;
 import java.time.LocalDateTime;
 import java.util.UUID;
@@ -48,7 +49,7 @@ public class AgentSession implements Serializable {
 
     @Column(columnDefinition = "jsonb")
     @JdbcTypeCode(SqlTypes.JSON)
-    private Object metadata; // Session metadata (tokens used, duration, decision points)
+    private ObjectNode metadata; // Session metadata (tokens used, duration, decision points)
 
     @Column(length = 5000)
     private String reasoningSummary; // Why decisions were made (design choices, trade-offs)

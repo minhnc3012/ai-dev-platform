@@ -19,7 +19,9 @@ import com.aidevplatform.ui.MainLayout;
 import com.aidevplatform.ui.components.AgentLogPanel;
 import com.vaadin.flow.component.AttachEvent;
 import com.vaadin.flow.component.DetachEvent;
+import com.vaadin.flow.component.UI;
 import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.shared.Registration;
 import com.vaadin.flow.component.button.ButtonVariant;
 import com.vaadin.flow.component.dialog.Dialog;
 import com.vaadin.flow.component.html.*;
@@ -81,6 +83,7 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
     // ── State ─────────────────────────────────────────────────────────────────
     private UUID moduleId;
     private UUID broadcastRegistrationId;
+    private Registration pollRegistration;
     private String selectedAgent; // agent whose report is shown in the Report tab
 
     // ── Live-updatable row parts ──────────────────────────────────────────────
@@ -136,10 +139,18 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
     @Override
     protected void onAttach(AttachEvent event) {
         super.onAttach(event);
+        UI ui = event.getUI();
         if (moduleId != null && broadcastRegistrationId == null) {
             broadcastRegistrationId = uiEventBroadcaster.registerListener(
-                    moduleId, event.getUI(), this::onAgentEvent);
+                    moduleId, ui, this::onAgentEvent);
         }
+        // Poll every 3 s as a guaranteed delivery channel — push (@Push WebSocket) delivers
+        // updates immediately when the connection is healthy; the poll catches anything the
+        // push missed (transport hiccup, session-lock contention, etc.).
+        ui.setPollInterval(3000);
+        pollRegistration = ui.addPollListener(e -> {
+            if (moduleId != null) refreshRunStates();
+        });
     }
 
     @Override
@@ -148,6 +159,11 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
             uiEventBroadcaster.unregisterListener(broadcastRegistrationId);
             broadcastRegistrationId = null;
         }
+        if (pollRegistration != null) {
+            pollRegistration.remove();
+            pollRegistration = null;
+        }
+        event.getUI().setPollInterval(-1);
         super.onDetach(event);
     }
 
@@ -468,6 +484,37 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
 
         } catch (Exception e) {
             log.error("Failed to load state for module {}: {}", moduleId, e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Lightweight poll-driven refresh: updates row indicators and summary badges
+     * from the DB without touching the event log or report pane (no flicker).
+     * Called every 3 s by the UI poll listener as a fallback delivery channel
+     * for updates that the @Push WebSocket may have missed.
+     */
+    private void refreshRunStates() {
+        try {
+            List<AgentRun> runs = agentRunRepository.findAllByModuleIdWithReportAndRun(moduleId);
+            runs.forEach(run -> {
+                RowRefs refs = rowMap.get(run.getAgentName());
+                if (refs != null) updateRowFromRun(refs, run);
+            });
+            updateSummaryBadges(runs);
+
+            // Stop polling once the pipeline is fully finished — no further updates expected.
+            boolean pipelineActive = runs.stream().anyMatch(r ->
+                    r.getStatus() == AgentRunStatus.RUNNING
+                    || r.getStatus() == AgentRunStatus.PENDING
+                    || r.getStatus() == AgentRunStatus.AWAITING_APPROVAL);
+            if (!pipelineActive && pollRegistration != null) {
+                pollRegistration.remove();
+                pollRegistration = null;
+                UI.getCurrent().setPollInterval(-1);
+                log.debug("Pipeline complete — stopped UI polling for module {}", moduleId);
+            }
+        } catch (Exception e) {
+            log.warn("Poll refresh failed for module {}: {}", moduleId, e.getMessage());
         }
     }
 

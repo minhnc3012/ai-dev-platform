@@ -10,10 +10,10 @@ import com.aidevplatform.repository.AgentRunRepository;
 import jakarta.persistence.EntityNotFoundException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -35,7 +35,7 @@ public class AgentEventService {
      */
     @Transactional
     public AgentEvent saveAndBroadcast(UUID runId, AgentEventType type,
-                                        String message, Map<String, Object> payload) {
+                                        String message, ObjectNode payload) {
         // Handle orphaned events gracefully - e.g., when tables were truncated
         // but background processes still send events
         AgentRun run = agentRunRepository.findById(runId).orElse(null);

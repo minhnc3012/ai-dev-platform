@@ -8,6 +8,7 @@ import com.aidevplatform.repository.AgentRunRepository;
 import com.aidevplatform.repository.AgentSessionRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -16,7 +17,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
-import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -59,17 +59,19 @@ public class SessionCompressorService {
         }
 
         // Extract structured facts
-        Map<String, Object> facts = new java.util.HashMap<>();
+        ObjectNode facts = objectMapper.createObjectNode();
         if (report.getDeliverables() != null && !report.getDeliverables().isEmpty()) {
-            facts.put("deliverables", report.getDeliverables());
+            facts.set("deliverables", objectMapper.valueToTree(report.getDeliverables()));
         }
         if (report.getIssuesFound() != null && !report.getIssuesFound().isEmpty()) {
-            facts.put("issues", report.getIssuesFound());
+            facts.set("issues", objectMapper.valueToTree(report.getIssuesFound()));
         }
         if (report.getOwnerDecisionsNeeded() != null && !report.getOwnerDecisionsNeeded().isEmpty()) {
-            facts.put("decisions", report.getOwnerDecisionsNeeded());
+            facts.set("decisions", objectMapper.valueToTree(report.getOwnerDecisionsNeeded()));
         }
-        facts.put("confidenceScore", report.getConfidenceScore());
+        if (report.getConfidenceScore() != null) {
+            facts.put("confidenceScore", report.getConfidenceScore());
+        }
         if (report.getConfidenceReason() != null) {
             facts.put("confidenceReason", report.getConfidenceReason());
         }
@@ -108,7 +110,7 @@ public class SessionCompressorService {
         String reasoningSummary = "Design decisions will be captured when implemented.";
 
         // 2. Extract structured facts
-        Map<String, Object> facts = extractStructuredFacts(run);
+        ObjectNode facts = extractStructuredFacts(run);
 
         // 3. Save raw recent messages to Redis (ephemeral)
         String recentMessages = extractRecentMessages(chatHistory, MAX_RAW_MESSAGES);
@@ -155,27 +157,28 @@ public class SessionCompressorService {
     /**
      * Extracts structured facts that should never be forgotten.
      */
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> extractStructuredFacts(AgentRun run) {
+    private ObjectNode extractStructuredFacts(AgentRun run) {
         return agentReportRepository.findByRunId(run.getId())
                 .map(report -> {
-                    Map<String, Object> facts = new java.util.HashMap<>();
+                    ObjectNode facts = objectMapper.createObjectNode();
                     if (report.getDeliverables() != null && !report.getDeliverables().isEmpty()) {
-                        facts.put("deliverables", report.getDeliverables());
+                        facts.set("deliverables", objectMapper.valueToTree(report.getDeliverables()));
                     }
                     if (report.getIssuesFound() != null && !report.getIssuesFound().isEmpty()) {
-                        facts.put("issues", report.getIssuesFound());
+                        facts.set("issues", objectMapper.valueToTree(report.getIssuesFound()));
                     }
                     if (report.getOwnerDecisionsNeeded() != null && !report.getOwnerDecisionsNeeded().isEmpty()) {
-                        facts.put("decisions", report.getOwnerDecisionsNeeded());
+                        facts.set("decisions", objectMapper.valueToTree(report.getOwnerDecisionsNeeded()));
                     }
-                    facts.put("confidenceScore", report.getConfidenceScore());
+                    if (report.getConfidenceScore() != null) {
+                        facts.put("confidenceScore", report.getConfidenceScore());
+                    }
                     if (report.getConfidenceReason() != null) {
                         facts.put("confidenceReason", report.getConfidenceReason());
                     }
                     return facts;
                 })
-                .orElse(Map.of());
+                .orElse(objectMapper.createObjectNode());
     }
 
     /**
@@ -223,22 +226,24 @@ public class SessionCompressorService {
     public ResumptionContext getSessionContext(UUID runId) {
         AgentSession session = sessionRepository.findByRunId(runId).orElse(null);
 
-        Map<String, Object> structuredFacts = null;
+        ObjectNode structuredFacts = null;
         String sessionSummary = null;
         String reasoningSummary = null;
 
         if (session != null) {
-            structuredFacts = (Map<String, Object>) session.getMetadata();
+            structuredFacts = session.getMetadata();
             sessionSummary = session.getSummary();
             reasoningSummary = session.getReasoningSummary();
         } else {
             AgentReport report = agentReportRepository.findByRunId(runId).orElse(null);
             if (report != null) {
-                structuredFacts = Map.of(
-                        "deliverables", report.getDeliverables(),
-                        "issues", report.getIssuesFound(),
-                        "confidenceScore", report.getConfidenceScore()
-                );
+                ObjectNode node = objectMapper.createObjectNode();
+                node.set("deliverables", objectMapper.valueToTree(report.getDeliverables()));
+                node.set("issues", objectMapper.valueToTree(report.getIssuesFound()));
+                if (report.getConfidenceScore() != null) {
+                    node.put("confidenceScore", report.getConfidenceScore());
+                }
+                structuredFacts = node;
                 sessionSummary = report.getSummary();
             }
         }
@@ -252,7 +257,7 @@ public class SessionCompressorService {
      * Represents the context to inject into an agent's system prompt.
      */
     public record ResumptionContext(
-            Map<String, Object> structuredFacts,
+            ObjectNode structuredFacts,
             String sessionSummary,
             String reasoningSummary,
             String recentRawMessages
@@ -267,7 +272,7 @@ public class SessionCompressorService {
             // Tier 1: Structured facts
             sb.append("## Completed Work (Structured Facts)\n");
             if (structuredFacts != null && !structuredFacts.isEmpty()) {
-                sb.append(structuredFacts).append("\n\n");
+                sb.append(structuredFacts.toPrettyString()).append("\n\n");
             } else {
                 sb.append("(No structured facts yet)\n\n");
             }

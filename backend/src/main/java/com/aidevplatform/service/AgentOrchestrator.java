@@ -1,7 +1,8 @@
 package com.aidevplatform.service;
 
 import com.aidevplatform.api.dto.AgentCallbackDto;
-import com.aidevplatform.api.dto.AgentReportDto;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.aidevplatform.service.AgentSignalProducer;
 import com.aidevplatform.domain.entity.AgentReport;
 import com.aidevplatform.domain.entity.AgentRun;
 import com.aidevplatform.domain.entity.AiConfig;
@@ -11,7 +12,9 @@ import com.aidevplatform.domain.enums.ModuleStatus;
 import com.aidevplatform.domain.model.*;
 import com.aidevplatform.repository.*;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import jakarta.persistence.EntityNotFoundException;
 import lombok.RequiredArgsConstructor;
@@ -19,9 +22,12 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDateTime;
 import java.util.*;
@@ -44,6 +50,8 @@ public class AgentOrchestrator {
     private final RedisTemplate<String, String> redisTemplate;
     private final SessionCompressorService sessionCompressorService;
     private final ChatSummarizationService chatSummarizationService;
+    private final AgentSignalProducer agentSignalProducer;
+    private final PlatformTransactionManager transactionManager;
 
     private final ObjectMapper objectMapper = new ObjectMapper()
             .registerModule(new JavaTimeModule());
@@ -171,8 +179,15 @@ public class AgentOrchestrator {
         }
         agentRunRepository.save(run);
 
-        // Persist the structured report
-        AgentReport report = mapToReport(callback.getReport(), run);
+        // Persist the structured report (upsert: update if already exists)
+        AgentReport report = agentReportRepository.findByRunId(run.getId())
+                .map(existing -> {
+                    AgentReport updated = mapToReport(callback.getReport(), run);
+                    updated.setId(existing.getId());
+                    updated.setCreatedAt(existing.getCreatedAt());
+                    return updated;
+                })
+                .orElseGet(() -> mapToReport(callback.getReport(), run));
         agentReportRepository.save(report);
 
         // Flush to ensure PostgreSQL commit changes before triggering next agent
@@ -191,10 +206,21 @@ public class AgentOrchestrator {
         AiConfig config = run.getModule().getProject().getAiConfig();
         String ownerId = run.getModule().getProject().getOwner().getId().toString();
 
-        if (Boolean.TRUE.equals(config.getApprovalRequired())) {
+        // Dev → QA/Docs is always auto-triggered even when approvalRequired=true,
+        // because QA and Docs are the terminal parallel agents (no sequential handoff).
+        boolean nextIsParallelTerminal = isNextStepParallelTerminal(run.getModule());
+
+        if (Boolean.TRUE.equals(config.getApprovalRequired()) && !nextIsParallelTerminal) {
             run.setStatus(AgentRunStatus.AWAITING_APPROVAL);
             agentRunRepository.save(run);
             sseService.broadcastAgentAwaitingApproval(ownerId, run.getId());
+
+            // Publish APPROVE signal to Redis Stream
+            agentSignalProducer.publishApproveSignal(
+                    run.getId().toString(),
+                    run.getModule().getId().toString(),
+                    run.getAgentName()
+            );
 
             final UUID pendingRunId = run.getId();
             final UUID pendingModuleId = run.getModule().getId();
@@ -214,37 +240,48 @@ public class AgentOrchestrator {
                     uiEventBroadcaster.broadcast(dto, pendingModuleId);
                 }
             });
-            log.info("Agent run awaiting approval: runId={}", run.getId());
+            log.info("Agent run awaiting approval: runId={}, signal published", run.getId());
         } else {
-            // Register synchronization to trigger next agent AFTER transaction commit
+            // Publish COMPLETE signal for auto-trigger case
+            agentSignalProducer.publishCompleteSignal(
+                    run.getId().toString(),
+                    run.getModule().getId().toString(),
+                    run.getAgentName()
+            );
+
+            // Capture IDs before the lambda — safe to read from initialized proxy after commit
+            final UUID nextModuleId = run.getModule().getId();
+            // Register synchronization to trigger next agent AFTER transaction commit.
+            // Wrapping in a new TransactionTemplate is required: afterCommit() runs outside
+            // any transaction, so lazy associations on entities loaded inside it (e.g.
+            // AgentRun.module.project.aiConfig) would throw LazyInitializationException.
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
                     try {
-                        triggerNextAgentAfterCommit(run.getModule(), ownerId);
-                        log.info("Triggered next agent after transaction commit for module={}", run.getModule().getId());
+                        // REQUIRES_NEW is mandatory here: the outer transaction's ThreadLocal
+                        // state (isActualTransactionActive) is still true while afterCommit()
+                        // runs (cleanup fires after all callbacks). PROPAGATION_REQUIRED would
+                        // silently join the already-committed outer transaction, so any
+                        // synchronization registered by dispatchAfterCommit() inside the lambda
+                        // would be appended to the outer's already-iterated snapshot and never
+                        // invoked — causing the Redis dispatch to be silently dropped.
+                        TransactionTemplate tt = new TransactionTemplate(transactionManager);
+                        tt.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+                        tt.execute(status -> {
+                            Module m = moduleRepository.findById(nextModuleId)
+                                    .orElseThrow(() -> new EntityNotFoundException("Module not found: " + nextModuleId));
+                            ensureAgentRunsExist(m);
+                            triggerNextAgent(m, ownerId);
+                            return null;
+                        });
+                        log.info("Triggered next agent after transaction commit for module={}", nextModuleId);
                     } catch (Exception e) {
-                        log.error("Failed to trigger next agent after commit for module={}", run.getModule().getId(), e);
+                        log.error("Failed to trigger next agent after commit for module={}", nextModuleId, e);
                     }
                 }
             });
         }
-    }
-
-    /**
-     * Wrapper method to trigger next agent after transaction commit.
-     * Ensures all entities are refreshed and PENDING runs exist.
-     */
-    private void triggerNextAgentAfterCommit(Module module, String ownerId) {
-        // Force refresh module entity to get latest state
-        Module refreshedModule = moduleRepository.findById(module.getId())
-                .orElseThrow(() -> new EntityNotFoundException("Module not found: " + module.getId()));
-
-        // Ensure all expected agent runs exist
-        ensureAgentRunsExist(refreshedModule);
-
-        // Now trigger next agent
-        triggerNextAgent(refreshedModule, ownerId);
     }
 
     /**
@@ -291,9 +328,16 @@ public class AgentOrchestrator {
         run.setStatus(AgentRunStatus.APPROVED);
         agentRunRepository.save(run);
 
+        // Publish APPROVE signal to Redis Stream
+        agentSignalProducer.publishApproveSignal(
+                run.getId().toString(),
+                run.getModule().getId().toString(),
+                run.getAgentName()
+        );
+
         String ownerId = run.getModule().getProject().getOwner().getId().toString();
         triggerNextAgent(run.getModule(), ownerId);
-        log.info("Agent run approved: runId={}", runId);
+        log.info("Agent run approved: runId={}, signal published", runId);
     }
 
     /**
@@ -310,17 +354,20 @@ public class AgentOrchestrator {
 
         String ownerId = run.getModule().getProject().getOwner().getId().toString();
         sseService.broadcastRunRejected(ownerId, runId, reason);
-        log.info("Agent run rejected: runId={}, reason={}", runId, reason);
 
-        // Create retry run
-        AgentRun retryRun = AgentRun.builder()
-                .module(run.getModule())
-                .agentName(run.getAgentName())
-                .runOrder(run.getRunOrder())
-                .status(AgentRunStatus.PENDING)
-                .retryCount(run.getRetryCount())
-                .build();
-        agentRunRepository.save(retryRun);
+        // Publish REJECT signal to Redis Stream
+        agentSignalProducer.publishRejectSignal(
+                run.getId().toString(),
+                run.getModule().getId().toString(),
+                run.getAgentName(),
+                reason
+        );
+
+        log.info("Agent run rejected: runId={}, reason={}, signal published", runId, reason);
+
+        // Reset to PENDING for retry (reuse existing run to avoid unique constraint on module_id+agent_name)
+        run.setStatus(AgentRunStatus.PENDING);
+        agentRunRepository.save(run);
         triggerNextAgent(run.getModule(), ownerId);
     }
 
@@ -365,7 +412,7 @@ public class AgentOrchestrator {
                     .filter(r -> "qa".equals(r.getAgentName()) || "docs".equals(r.getAgentName()))
                     .toList();
 
-            if (parallelAgents.size() == 2) {
+            if (parallelAgents.size() == 2 && pending.size() == 2) {
                 log.info("triggerNextAgent: triggering parallel QA and Docs agents");
                 triggerParallelAgents(parallelAgents, module, ownerId);
             } else {
@@ -411,6 +458,21 @@ public class AgentOrchestrator {
                 || status == AgentRunStatus.FAILED;
     }
 
+    /**
+     * Returns true when the only remaining PENDING agents are QA and/or Docs.
+     * Used to bypass the owner-approval gate when transitioning from Dev to the
+     * terminal parallel agents — per spec, Dev → (QA ‖ Docs) is always auto-triggered.
+     */
+    private boolean isNextStepParallelTerminal(Module module) {
+        List<AgentRun> allRuns = agentRunRepository.findByModuleIdOrderByRunOrderAsc(module.getId());
+        List<String> pendingNames = allRuns.stream()
+                .filter(r -> r.getStatus() == AgentRunStatus.PENDING)
+                .map(AgentRun::getAgentName)
+                .toList();
+        return !pendingNames.isEmpty()
+                && pendingNames.stream().allMatch(n -> "qa".equals(n) || "docs".equals(n));
+    }
+
     private void triggerParallelAgents(List<AgentRun> agents, Module module, String ownerId) {
         for (AgentRun agentRun : agents) {
             agentRun.setStatus(AgentRunStatus.RUNNING);
@@ -426,8 +488,12 @@ public class AgentOrchestrator {
         for (AgentRun agentRun : agents) {
             try {
                 Map<String, Object> taskConfig = buildFullTaskConfig(agentRun);
-                redisTemplate.convertAndSend("agent:next", objectMapper.writeValueAsString(taskConfig));
-                log.info("Parallel agent triggered: runId={}, agent={}", agentRun.getId(), agentRun.getAgentName());
+                String taskJson = objectMapper.writeValueAsString(taskConfig);
+                UUID dispatchRunId = agentRun.getId();
+                String dispatchAgentName = agentRun.getAgentName();
+                // Dispatch AFTER the current transaction commits so the RUNNING status is
+                // visible to handleAgentComplete before the Python agent can call back.
+                dispatchAfterCommit("agent:next", taskJson, dispatchRunId, dispatchAgentName);
             } catch (JsonProcessingException e) {
                 log.error("Failed to dispatch parallel agent task: runId={}", agentRun.getId(), e);
             }
@@ -443,12 +509,40 @@ public class AgentOrchestrator {
         module.setStatus(resolveRunningStatus(next.getAgentName()));
         moduleRepository.save(module);
 
+        // Immediately notify the UI so the row flips to RUNNING without waiting
+        // for Python's STARTED event (which arrives after the Redis round-trip).
+        broadcastStatusEvent(next, "STARTED", "Agent " + next.getAgentName() + " dispatched, starting…");
+
         try {
             Map<String, Object> taskConfig = buildFullTaskConfig(next);
-            redisTemplate.convertAndSend("agent:next", objectMapper.writeValueAsString(taskConfig));
-            log.info("Next agent triggered: runId={}, agent={}", next.getId(), next.getAgentName());
+            String taskJson = objectMapper.writeValueAsString(taskConfig);
+            UUID dispatchRunId = next.getId();
+            String dispatchAgentName = next.getAgentName();
+            // Dispatch AFTER the current transaction commits so the RUNNING status is
+            // visible to handleAgentComplete before the Python agent can call back.
+            dispatchAfterCommit("agent:next", taskJson, dispatchRunId, dispatchAgentName);
         } catch (JsonProcessingException e) {
             log.error("Failed to dispatch next agent task: runId={}", next.getId(), e);
+        }
+    }
+
+    /**
+     * Sends a Redis message after the current transaction commits, or immediately if no
+     * transaction is active. This prevents the race condition where Python receives a task
+     * and calls back before the RUNNING status is committed to the database.
+     */
+    private void dispatchAfterCommit(String channel, String taskJson, UUID runId, String agentName) {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    redisTemplate.convertAndSend(channel, taskJson);
+                    log.info("Next agent triggered: runId={}, agent={}", runId, agentName);
+                }
+            });
+        } else {
+            redisTemplate.convertAndSend(channel, taskJson);
+            log.info("Next agent triggered: runId={}, agent={}", runId, agentName);
         }
     }
 
@@ -546,7 +640,7 @@ public class AgentOrchestrator {
     private SessionCompressorService.ResumptionContext buildAccumulatedMemoryContext(AgentRun run) {
         List<AgentRun> allRuns = agentRunRepository.findByModuleIdOrderByRunOrderAsc(run.getModule().getId());
 
-        Map<String, Object> accumulatedFacts = new HashMap<>();
+        com.fasterxml.jackson.databind.node.ObjectNode accumulatedFacts = objectMapper.createObjectNode();
         Map<String, String> allSummaries = new LinkedHashMap<>();
 
         for (AgentRun prev : allRuns) {
@@ -558,20 +652,22 @@ public class AgentOrchestrator {
                     allSummaries.put(prev.getAgentName(), prevReport.getSummary());
 
                     if (prevReport.getDeliverables() != null) {
-                        accumulatedFacts.put(prev.getAgentName() + "_deliverables", prevReport.getDeliverables());
+                        accumulatedFacts.set(prev.getAgentName() + "_deliverables", objectMapper.valueToTree(prevReport.getDeliverables()));
                     }
                     if (prevReport.getIssuesFound() != null) {
-                        accumulatedFacts.put(prev.getAgentName() + "_issues", prevReport.getIssuesFound());
+                        accumulatedFacts.set(prev.getAgentName() + "_issues", objectMapper.valueToTree(prevReport.getIssuesFound()));
                     }
                 }
             }
         }
 
-        String reasoning = "Memory accumulated from previous completed agents.\n\n" +
-                "Key design decisions:\n" +
-                "- REST API with JSON payloads\n" +
-                "- JWT authentication with 24h token expiry\n" +
-                "- Modular architecture for extensibility";
+        // Do not inject hardcoded assumptions here — reasoning must come from
+        // actual previous-agent outputs, not from a fixed template that would
+        // override the real requirement (e.g. injecting "REST API / JWT" for a
+        // task that asked for nothing of the sort).
+        String reasoning = allSummaries.isEmpty()
+                ? ""
+                : "Context accumulated from previous agents: " + String.join(", ", allSummaries.keySet());
 
         return new SessionCompressorService.ResumptionContext(accumulatedFacts,
                 String.join("\n\n", allSummaries.values()),
@@ -592,8 +688,8 @@ public class AgentOrchestrator {
         sb.append("Current Agent: ").append(run.getAgentName()).append("\n\n");
 
         sb.append("## Completed Work (Structured Facts)\n");
-        if (context.structuredFacts() != null && !context.structuredFacts().isEmpty()) {
-            sb.append(context.structuredFacts()).append("\n\n");
+        if (context.structuredFacts() != null && context.structuredFacts().size() > 0) {
+            sb.append(context.structuredFacts().toPrettyString()).append("\n\n");
         } else {
             sb.append("(No structured facts yet)\n\n");
         }
@@ -718,16 +814,12 @@ public class AgentOrchestrator {
                 return "MAX_RETRIES_EXCEEDED:" + rejectedRun.getAgentName();
             }
 
-            AgentRun retryRun = AgentRun.builder()
-                    .module(module)
-                    .agentName(rejectedRun.getAgentName())
-                    .runOrder(rejectedRun.getRunOrder())
-                    .status(AgentRunStatus.PENDING)
-                    .retryCount(retryCount + 1)
-                    .build();
-            agentRunRepository.save(retryRun);
+            // Reset to PENDING for retry (reuse existing run to avoid unique constraint on module_id+agent_name)
+            rejectedRun.setStatus(AgentRunStatus.PENDING);
+            rejectedRun.setRetryCount(retryCount + 1);
+            agentRunRepository.save(rejectedRun);
             triggerNextAgent(module, ownerId);
-            log.info("resumePipeline: created retry run for rejected run={}", rejectedRun.getId());
+            log.info("resumePipeline: reset rejected run={} to PENDING for retry", rejectedRun.getId());
             return "RETRY_CREATED:" + rejectedRun.getAgentName();
         }
 
@@ -767,72 +859,95 @@ public class AgentOrchestrator {
         return result;
     }
 
-    private AgentReport mapToReport(AgentReportDto dto, AgentRun run) {
-        if (dto == null) {
+    private AgentReport mapToReport(ObjectNode node, AgentRun run) {
+        if (node == null || node.isNull()) {
             return AgentReport.builder()
                     .run(run)
                     .summary("No report provided")
                     .build();
         }
 
+        // Python sends snake_case: confidence_score, confidence_reason, tokens_used
+        String summary = node.path("summary").asText("");
+        java.math.BigDecimal confidenceScore = null;
+        JsonNode csNode = node.path("confidence_score");
+        if (!csNode.isMissingNode() && !csNode.isNull()) {
+            confidenceScore = csNode.decimalValue();
+        }
+        String confidenceReason = node.path("confidence_reason").isMissingNode() ? null
+                : node.path("confidence_reason").asText(null);
+        Integer tokensUsed = node.path("tokens_used").isMissingNode() ? null
+                : node.path("tokens_used").intValue();
+        Integer durationSeconds = node.path("duration_seconds").isMissingNode() ? null
+                : node.path("duration_seconds").intValue();
+
         AgentReport report = AgentReport.builder()
                 .run(run)
-                .summary(dto.getSummary() != null ? dto.getSummary() : "")
-                .confidenceScore(dto.getConfidenceScore())
-                .confidenceReason(dto.getConfidenceReason())
-                .tokensUsed(dto.getTokensUsed())
-                .durationSeconds(dto.getDurationSeconds())
+                .summary(summary)
+                .confidenceScore(confidenceScore)
+                .confidenceReason(confidenceReason)
+                .tokensUsed(tokensUsed)
+                .durationSeconds(durationSeconds)
                 .build();
 
-        if (dto.getDeliverables() != null) {
-            List<Deliverable> deliverables = dto.getDeliverables().stream()
-                    .map(m -> Deliverable.builder()
-                            .type((String) m.get("type"))
-                            .name((String) m.get("name"))
-                            .filePath((String) m.get("file_path"))
-                            .description((String) m.get("description"))
-                            .lines(m.get("lines") instanceof Number n ? n.intValue() : null)
-                            .build())
-                    .toList();
+        JsonNode deliverablesNode = node.path("deliverables");
+        if (deliverablesNode.isArray()) {
+            List<Deliverable> deliverables = new ArrayList<>();
+            for (JsonNode m : (ArrayNode) deliverablesNode) {
+                deliverables.add(Deliverable.builder()
+                        .type(m.path("type").asText(null))
+                        .name(m.path("name").asText(null))
+                        .filePath(m.path("file_path").asText(null))
+                        .description(m.path("description").asText(null))
+                        .lines(m.path("lines").isMissingNode() ? null : m.path("lines").intValue())
+                        .build());
+            }
             report.setDeliverables(deliverables);
         }
 
-        if (dto.getIssuesFound() != null) {
-            List<Issue> issues = dto.getIssuesFound().stream()
-                    .map(m -> Issue.builder()
-                            .severity((String) m.get("severity"))
-                            .description((String) m.get("description"))
-                            .suggestedAction((String) m.get("suggested_action"))
-                            .build())
-                    .toList();
+        JsonNode issuesNode = node.path("issues_found");
+        if (issuesNode.isArray()) {
+            List<Issue> issues = new ArrayList<>();
+            for (JsonNode m : (ArrayNode) issuesNode) {
+                issues.add(Issue.builder()
+                        .severity(m.path("severity").asText(null))
+                        .description(m.path("description").asText(null))
+                        .suggestedAction(m.path("suggested_action").asText(null))
+                        .build());
+            }
             report.setIssuesFound(issues);
         }
 
-        if (dto.getNextSteps() != null) {
-            List<NextStep> steps = dto.getNextSteps().stream()
-                    .map(m -> NextStep.builder()
-                            .action((String) m.get("action"))
-                            .agent((String) m.get("agent"))
-                            .priority((String) m.get("priority"))
-                            .build())
-                    .toList();
+        JsonNode nextStepsNode = node.path("next_steps");
+        if (nextStepsNode.isArray()) {
+            List<NextStep> steps = new ArrayList<>();
+            for (JsonNode m : (ArrayNode) nextStepsNode) {
+                steps.add(NextStep.builder()
+                        .action(m.path("action").asText(null))
+                        .agent(m.path("agent").asText(null))
+                        .priority(m.path("priority").asText(null))
+                        .build());
+            }
             report.setNextSteps(steps);
         }
 
-        if (dto.getOwnerDecisionsNeeded() != null) {
-            List<OwnerDecision> decisions = dto.getOwnerDecisionsNeeded().stream()
-                    .map(m -> {
-                        Object opts = m.get("options");
-                        List<String> options = opts instanceof List<?> l
-                                ? l.stream().map(Object::toString).toList()
-                                : List.of();
-                        return OwnerDecision.builder()
-                                .question((String) m.get("question"))
-                                .options(options)
-                                .impact((String) m.get("impact"))
-                                .build();
-                    })
-                    .toList();
+        JsonNode decisionsNode = node.path("owner_decisions_needed");
+        if (decisionsNode.isArray()) {
+            List<OwnerDecision> decisions = new ArrayList<>();
+            for (JsonNode m : (ArrayNode) decisionsNode) {
+                List<String> options = new ArrayList<>();
+                JsonNode optsNode = m.path("options");
+                if (optsNode.isArray()) {
+                    for (JsonNode opt : optsNode) {
+                        options.add(opt.asText());
+                    }
+                }
+                decisions.add(OwnerDecision.builder()
+                        .question(m.path("question").asText(null))
+                        .options(options)
+                        .impact(m.path("impact").asText(null))
+                        .build());
+            }
             report.setOwnerDecisionsNeeded(decisions);
         }
 

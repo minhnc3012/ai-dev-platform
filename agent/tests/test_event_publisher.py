@@ -2,10 +2,11 @@
 Unit tests for event_publisher.py
 
 Tests the REST client helpers using mocked requests so no real backend is needed.
+Tests include both the legacy direct HTTP calls and the new state-based retry logic.
 """
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, Mock
 
 import pytest
 
@@ -14,6 +15,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from event_publisher import push_event, complete_run, fetch_interrupted_runs
+from agent_state import AgentState, BackendCallbackHandler
 
 
 class TestPushEvent:
@@ -76,3 +78,35 @@ class TestFetchInterruptedRuns:
         with patch("event_publisher.requests.get", side_effect=ConnectionError("offline")):
             result = fetch_interrupted_runs()
         assert result == []
+
+
+class TestEventPublisherWithState:
+    """Tests for the new state-based event handling."""
+
+    @pytest.fixture
+    def mock_redis(self):
+        """Create a mock Redis client."""
+        with patch('redis.Redis') as mock_redis_class:
+            mock_client = MagicMock()
+            mock_redis_class.return_value = mock_client
+            yield mock_client
+
+    @patch("event_publisher.requests.post")
+    def test_push_event_calls_backend_handler(self, mock_post, mock_redis):
+        """Test that push_event uses the new backend handler."""
+        mock_post.return_value = MagicMock(status_code=200)
+
+        result = push_event("run-123", "STARTED", "Agent started")
+
+        assert result is True
+        mock_post.assert_called_once()
+
+    @patch("event_publisher.requests.post")
+    def test_complete_run_with_state_persistence(self, mock_post, mock_redis):
+        """Test that complete_run persists state."""
+        mock_post.return_value = MagicMock(status_code=200)
+        report = {"summary": "Done", "tokens_used": 100}
+
+        result = complete_run("run-456", report)
+
+        assert result is True

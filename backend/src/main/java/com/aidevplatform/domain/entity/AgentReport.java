@@ -28,23 +28,23 @@ public class AgentReport extends BaseEntity {
     @Column(columnDefinition = "text", nullable = false)
     private String summary;
 
-    @JdbcTypeCode(SqlTypes.JSON)
     @Column(columnDefinition = "jsonb")
+    @JdbcTypeCode(SqlTypes.JSON)
     @Builder.Default
     private List<Deliverable> deliverables = new ArrayList<>();
 
-    @JdbcTypeCode(SqlTypes.JSON)
     @Column(columnDefinition = "jsonb")
+    @JdbcTypeCode(SqlTypes.JSON)
     @Builder.Default
     private List<Issue> issuesFound = new ArrayList<>();
 
-    @JdbcTypeCode(SqlTypes.JSON)
     @Column(columnDefinition = "jsonb")
+    @JdbcTypeCode(SqlTypes.JSON)
     @Builder.Default
     private List<NextStep> nextSteps = new ArrayList<>();
 
-    @JdbcTypeCode(SqlTypes.JSON)
     @Column(columnDefinition = "jsonb")
+    @JdbcTypeCode(SqlTypes.JSON)
     @Builder.Default
     private List<OwnerDecision> ownerDecisionsNeeded = new ArrayList<>();
 

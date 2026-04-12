@@ -1683,9 +1683,12 @@ Claude Code must follow this sequence to avoid missing dependencies:
 12. Implement `ModuleManagerView` with drag-and-drop file upload
 13. Implement `AgentMonitorView` + `AgentStatusCard` + `AgentLogPanel`
 14. Implement `ReportView` + `ReportCard` component with approve/reject actions
-15. Set up Python agent layer: `event_publisher.py` → `crew_runner.py` → individual agent files
-16. Docker Compose for local development
-17. Wire SSE from backend to Vaadin UI — all agent events must propagate to the monitor view in real time
+15. Set up Redis Streams configuration and consumer group initialization
+16. Implement AgentSignalProducer and AgentSignalConsumer services
+17. Implement AgentSignal DTO and integrate with AgentOrchestrator
+18. Set up Python agent layer: `event_publisher.py` → `crew_runner.py` → individual agent files
+19. Docker Compose for local development
+20. Wire SSE from backend to Vaadin UI — all agent events must propagate to the monitor view in real time
 
 ---
 
@@ -1700,8 +1703,17 @@ Claude Code must follow this sequence to avoid missing dependencies:
 - **CLI mode safety**: When executing `llm_cli_command` via subprocess, always sanitise input and enforce a timeout (default 300 s). Never pass raw user input directly to the shell.
 - **Project context in tasks**: When building the agent task payload, always include `tech_stack`, `coding_style_guide`, `previous_outputs` from completed prior agents, and any uploaded context documents. This context is what makes agents generate code that fits the actual project.
 - **Language in code**: All code, comments, log messages, variable names, and UI labels in source files must be in English. The `output_language` setting in `AiConfig` only controls the natural-language content of agent reports — not source code.
+- **Redis Streams reliability**: Use `XREADGROUP` with consumer group for reliable message delivery. Implement message acknowledgment with `XACK` after successful processing. Signals remain in the stream until consumed and acknowledged. On restart, the consumer processes any unconsumed signals automatically.
+- **Signal deduplication**: Track processed signal IDs in `ConcurrentHashMap` with timestamp to avoid duplicate processing. Clean up stale entries every 60 minutes.
+- **Agent Service resilience**: The Python Agent Service must persist its run state in Redis for recovery after backend restarts. All completion callbacks must include retry logic with exponential backoff. The agent service listens for RESUME signals to retry pending callbacks after backend recovery.
+- **Backend-Agent communication flow**: 
+  1. Agent runs locally and tracks state in Redis
+  2. On completion, agent POSTs to `/api/internal/agent/complete` with retry logic
+  3. Backend persists report, sends APPROVAL/REJECTION signals via Redis Streams
+  4. Agent listens for signals via Redis Pub/Sub for real-time responsiveness
+  5. If backend restarts, it sends RESUME signals for stuck agent runs
+  6. Agent recovers by retrying completion callbacks with cached data
 
----
 
 ## 17. AiConfigForm — LLM provider switching UI
 
@@ -1727,12 +1739,346 @@ Claude Code must follow this sequence to avoid missing dependencies:
 
 ### AiConfigForm.java
 
+### Python Agent Service Resilience and State Management
+
+The Python Agent Service now includes comprehensive state persistence and retry mechanisms to handle backend service restarts and network failures gracefully.
+
+#### State Machine
+
+The agent service tracks each run through the following states:
+
+| State | Description | Persistence |
+|---|---|---|
+| `PENDING` | Agent has not started | Redis |
+| `RUNNING` | Agent is executing | Redis |
+| `COMPLETED` | Agent finished successfully | Redis + Backend ack |
+| `CALLING_BACKEND` | POSTing completion to backend | Redis |
+| `CALL_BACKEND_FAILED` | Backend unavailable, need to retry | Redis |
+| `CALL_BACKEND_ACKED` | Backend acknowledged completion | Redis |
+| `AWAITING_APPROVAL` | Waiting for owner decision from backend | Redis |
+| `RETRY_READY` | Ready to retry after backend restart | Redis |
+| `RETRYING` | Currently retrying failed callback | Redis |
+| `AWAITING_NEXT_TRIGGER` | Waiting for next agent trigger | Redis |
+
+#### Workflow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        AGENT SERVICE STATE MACHINE                      │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                         ┌────────────────┐
+                         │     PENDING    │
+                         └───────┬────────┘
+                                 │ Start agent
+                                 ▼
+                         ┌────────────────┐
+                         │    RUNNING     │
+                         └───────┬────────┘
+                                 │ Execution complete
+                                 ▼
+                         ┌────────────────┐
+                         │ CALLING_BACKEND│
+                         │  (POST /complete)│
+                         └───────┬────────┘
+                                 │
+                ┌────────────────┼────────────────┐
+                │                │                │
+          SUCCESS (200)     TIMEOUT            4xx/5xx
+                │                │                │
+                ▼                │                ▼
+         ┌────────────┐          │          ┌────────────────┐
+         │COMPLETED   │          │          │CALL_BACKEND    │
+         │CALL_ACKED  │          │          │FAILED          │
+         └────────────┘          │          └───────┬────────┘
+                │                │                  │
+                │                │            Retry with backoff
+                │                │                  │
+                │ 5 min timeout  │                  │ Max retries
+                │ (backend may   │                  │ exceeded
+                │  be down)      │                  │
+                ▼                ▼                  ▼
+         ┌─────────────────────────────────────────────────────┐
+         │         AWAITING APPROVAL / RESUME SIGNAL           │
+         └─────────────────────────────────────────────────────┘
+                          │
+                          │ Backend RESUME signal
+                          ▼
+         ┌─────────────────────────────────────────────────────┐
+         │         RETRY_READY → CALLING_BACKEND → COMPLETED   │
+         └─────────────────────────────────────────────────────┘
+```
+
+#### Agent State Module (`agent_state.py`)
+
+```python
+"""
+Agent State Management Module
+
+Provides persistent state tracking for agent runs to ensure workflow continuity
+when the backend service restarts or is temporarily unavailable.
+"""
+
+import redis
+from enum import Enum
+from datetime import datetime
+from typing import Optional, Dict, Any
+
+class AgentRunState(Enum):
+    """State machine for agent run lifecycle tracking."""
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    CALLING_BACKEND = "CALLING_BACKEND"
+    CALL_BACKEND_FAILED = "CALL_BACKEND_FAILED"
+    CALL_BACKEND_ACKED = "CALL_BACKEND_ACKED"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    RETRY_READY = "RETRY_READY"
+    RETRYING = "RETRYING"
+    AWAITING_NEXT_TRIGGER = "AWAITING_NEXT_TRIGGER"
+
+
+class AgentState:
+    """
+    Persistent state tracker for agent runs.
+    All state is stored in Redis for durability.
+    """
+
+    def __init__(self, redis_client: Optional[redis.Redis] = None):
+        self.redis = redis_client or redis.Redis(
+            host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True
+        )
+
+    def save_run_state(
+        self,
+        run_id: str,
+        state: AgentRunState,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Persist run state to Redis.
+
+        Args:
+            run_id: UUID string of the agent run
+            state: Current state of the run
+            metadata: Additional data to persist
+
+        Returns:
+            True if state was saved successfully
+        """
+        key = f"agent:run:{run_id}"
+        store_data = {
+            "state": state.value,
+            "timestamp": datetime.utcnow().isoformat(),
+            "metadata": json.dumps(metadata or {}),
+        }
+        self.redis.hset(key, mapping=store_data)
+        self.redis.expire(key, 604800)  # 7 days TTL
+        return True
+
+    def get_run_state(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve run state from Redis."""
+        key = f"agent:run:{run_id}"
+        data = self.redis.hgetall(key)
+        if not data:
+            return None
+        return {
+            "run_id": run_id,
+            "state": AgentRunState(data["state"]),
+            "timestamp": data["timestamp"],
+            "metadata": json.loads(data["metadata"]),
+        }
+
+    def get_all_stuck_runs(self) -> list:
+        """Find all runs that need attention."""
+        stuck_states = [
+            AgentRunState.CALL_BACKEND_FAILED,
+            AgentRunState.AWAITING_APPROVAL,
+            AgentRunState.AWAITING_NEXT_TRIGGER,
+        ]
+        all_keys = self.redis.keys("agent:run:*")
+        return [
+            key.replace("agent:run:", "")
+            for key in all_keys
+            if self.redis.hgetall(key).get("state") in stuck_states
+        ]
+
+
+class BackendCallbackHandler:
+    """
+    Handles callbacks to the backend with retry logic and state persistence.
+    Uses exponential backoff for failed requests.
+    """
+
+    MAX_RETRY_ATTEMPTS = 5
+    RETRY_BASE_DELAY_SECONDS = 5
+    MAX_RETRY_DELAY_SECONDS = 60
+
+    def __init__(self, backend_url: str, state_tracker: AgentState):
+        self.backend_url = backend_url
+        self.state_tracker = state_tracker
+        self._headers = {
+            "Content-Type": "application/json",
+            "X-Agent-Key": os.getenv("AGENT_API_KEY"),
+        }
+
+    def complete_run(self, run_id: str, report: dict) -> bool:
+        """
+        Notify the backend that an agent run has completed.
+        Implements retry logic with state persistence.
+
+        Args:
+            run_id: UUID string of the agent run
+            report: Structured report dict
+
+        Returns:
+            True if completion was successfully reported
+        """
+        # Save state: calling backend
+        self.state_tracker.save_run_state(
+            run_id, AgentRunState.CALLING_BACKEND, {"retry_count": 0}
+        )
+
+        for attempt in range(1, self.MAX_RETRY_ATTEMPTS + 1):
+            try:
+                response = requests.post(
+                    f"{self.backend_url}/complete",
+                    json={"runId": run_id, "report": report},
+                    headers=self._headers,
+                    timeout=30
+                )
+                if response.status_code == 200:
+                    # Success - mark as acknowledged
+                    self.state_tracker.save_run_state(
+                        run_id,
+                        AgentRunState.CALL_BACKEND_ACKED,
+                        {"backend_ack": True, "attempts": attempt}
+                    )
+                    return True
+
+                # Non-retryable error
+                raise Exception(f"HTTP {response.status_code}")
+
+            except requests.RequestException as e:
+                if attempt < self.MAX_RETRY_ATTEMPTS:
+                    delay = min(5 * (2 ** (attempt - 1)), 60)
+                    time.sleep(delay)  # Exponential backoff
+                    continue
+                else:
+                    # Max retries exceeded
+                    self.state_tracker.save_run_state(
+                        run_id,
+                        AgentRunState.CALL_BACKEND_FAILED,
+                        {"error": str(e), "final_attempt": attempt}
+                    )
+                    return False
+        return False
+
+
+def recover_stuck_runs(state_tracker: AgentState) -> list:
+    """
+    On agent service startup, recover runs that were stuck.
+
+    Returns:
+        List of run_ids that were recovered
+    """
+    stuck_runs = state_tracker.get_all_stuck_runs()
+    for run_id in stuck_runs:
+        state = state_tracker.get_run_state(run_id)
+        if state["state"] == AgentRunState.CALL_BACKEND_FAILED:
+            # Retry the completion callback
+            callback_handler = BackendCallbackHandler(...)
+            callback_handler.complete_run(run_id, state["metadata"].get("report"))
+    return stuck_runs
+```
+
+#### Integration with Agent Service (`main.py`)
+
+```python
+from agent_state import AgentState, recover_stuck_runs, SignalConsumer
+
+def main():
+    # Initialize Redis
+    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+
+    # Start signal consumer for RESUME/APPROVE/REJECT signals
+    signal_consumer = SignalConsumer(redis_client=redis_client)
+    signal_consumer.start()
+
+    # Recover stuck runs on startup
+    recover_stuck_runs(AgentState(redis_client))
+
+    # Main message processing loop
+    pubsub = redis_client.pubsub()
+    pubsub.subscribe(TASK_CHANNEL, NEXT_CHANNEL)
+    # ... process messages
+```
+
+#### RESUME Signal Handling
+
+When the backend restarts, it can send a RESUME signal to the agent service:
+
+```python
+# SignalConsumer handles RESUME signals
+def _handle_resume_signal(self, signal_data: dict):
+    """Retry completion callbacks on backend restart."""
+    run_id = signal_data.get("run_id")
+    callback_handler = BackendCallbackHandler()
+    callback_handler.complete_run(run_id, cached_report)
+```
+
+### Backend Integration
+
+The Spring Boot backend sends RESUME signals when it detects stuck agent runs:
+
 ```java
-/**
- * Form component for editing per-project AI configuration.
- * Renders conditional fields based on the selected LLmInvocationMode.
- * Can be embedded in ProjectSettingsView or shown as a dialog.
- */
+// AgentSignalProducer.java
+public void publishResumeSignal(Long moduleId, String reason) {
+    AgentSignal signal = AgentSignal.createResumeSignal(
+        java.util.UUID.fromString(Long.toString(moduleId)),
+        reason
+    );
+    publishSignal(signal);
+}
+```
+
+```java
+// AgentSignalConsumer.java - Backend side
+@Scheduled(fixedDelay = 30000)
+public void checkStuckAgentRuns() {
+    List<AgentRun> stuckRuns = agentRunRepository.findCompletedUnacknowledged();
+    for (AgentRun run : stuckRuns) {
+        agentSignalProducer.publishResumeSignal(
+            run.getModule().getId().toString(),
+            "Backend restart - retry completion callback"
+        );
+    }
+}
+```
+
+### Configuration
+
+```yaml
+# application.yml for Agent Service
+agent:
+  service-url: ${BACKEND_URL:http://localhost:8080/api/internal/agent}
+  internal-api-key: ${AGENT_API_KEY:dev-secret}
+
+# Retry configuration
+agent:
+  retry:
+    max-attempts: 5
+    base-delay-ms: 5000
+    max-delay-ms: 60000
+
+# Signal consumer configuration
+agent:
+  signal:
+    poll-interval-ms: 5000
+    batch-size: 10
+```
+
+## 17. AiConfigForm — LLM provider switching UI
 public class AiConfigForm extends FormLayout {
 
     private final Select<String> llmProvider = new Select<>();
@@ -1807,60 +2153,656 @@ public class AiConfigForm extends FormLayout {
         updateFieldVisibility(LlmInvocationMode.API); // initial state
     }
 
-    private void updateFieldVisibility(LlmInvocationMode mode) {
-        llmBaseUrl.setVisible(mode == LlmInvocationMode.API);
-        llmModelName.setVisible(mode == LlmInvocationMode.API || mode == LlmInvocationMode.SDK);
-        llmApiKey.setVisible(mode == LlmInvocationMode.API || mode == LlmInvocationMode.SDK);
-        llmCliCommand.setVisible(mode == LlmInvocationMode.CLI);
+---
 
-        if (mode == LlmInvocationMode.SDK) {
-            llmApiKey.setRequired(true);
-            llmApiKey.setHelperText("Required for SDK mode");
-        } else {
-            llmApiKey.setRequired(false);
-            llmApiKey.setHelperText("Leave empty for local models");
-        }
-    }
+## 18. Redis Streams — Agent Signal Communication
 
-    /** Populate the form with an existing AiConfig. */
-    public void loadFrom(AiConfig config) {
-        llmProvider.setValue(config.getLlmProvider());
-        invocationMode.setValue(config.getInvocationMode());
-        llmBaseUrl.setValue(Optional.ofNullable(config.getLlmBaseUrl()).orElse(""));
-        llmModelName.setValue(Optional.ofNullable(config.getLlmModelName()).orElse(""));
-        llmApiKey.setValue(Optional.ofNullable(config.getLlmApiKey()).orElse(""));
-        llmCliCommand.setValue(Optional.ofNullable(config.getLlmCliCommand()).orElse(""));
-        outputLanguage.setValue(Optional.ofNullable(config.getOutputLanguage()).orElse("en"));
-        approvalRequired.setValue(Boolean.TRUE.equals(config.getApprovalRequired()));
-        activeAgents.setValue(new HashSet<>(
-            Optional.ofNullable(config.getActiveAgents()).orElse(List.of())
-        ));
-    }
+### Architecture Overview
 
-    /** Write form values back into an AiConfig entity. */
-    public void writeTo(AiConfig config) {
-        config.setLlmProvider(llmProvider.getValue());
-        config.setInvocationMode(invocationMode.getValue());
-        config.setLlmBaseUrl(llmBaseUrl.getValue());
-        config.setLlmModelName(llmModelName.getValue());
-        config.setLlmApiKey(llmApiKey.getValue().isBlank() ? null : llmApiKey.getValue());
-        config.setLlmCliCommand(llmCliCommand.getValue().isBlank() ? null : llmCliCommand.getValue());
-        config.setOutputLanguage(outputLanguage.getValue());
-        config.setApprovalRequired(approvalRequired.getValue());
-        config.setActiveAgents(new ArrayList<>(activeAgents.getValue()));
+To ensure reliable communication between Agent Service and Backend Service when they cannot connect directly (network issues, service restarts, etc.), the system uses Redis Streams as a persistent message broker.
+
+**Key features:**
+- **Persistence**: Messages remain in the stream until consumed and acknowledged
+- **Reliability**: Auto-retry on failure — failed signals stay in the stream
+- **Ordering**: Guaranteed message order within a stream
+- **Decoupling**: Agent Service and Backend Service communicate via Redis, not direct calls
+- **Auto-resume**: On restart, the consumer processes any unconsumed signals
+
+### Signal Types
+
+| Signal Type | Description | Trigger |
+|---|---|---|
+| `APPROVE` | Owner approved agent run, trigger next agent | Owner clicks approve |
+| `REJECT` | Agent run rejected, create retry and trigger next | Owner clicks reject with reason |
+| `COMPLETE` | Agent completed (auto-trigger case) | Agent finishes without approval |
+| `RESUME` | Pipeline resume after backend restart | Manual or automatic recovery |
+
+### Redis Stream Configuration
+
+**Stream name**: `agent:signals`
+
+**Consumer group**: `agent-consumers`
+
+**Consumer instance**: `backend-instance-1`
+
+**Poll interval**: 5000ms (5 seconds)
+
+**Batch size**: 10 messages per poll
+
+**Max entries**: 10,000 (old entries auto-trimmed)
+
+### Signal Flow Diagram
+
+```
+┌─────────────┐         ┌──────────────────────┐         ┌──────────────────┐
+│  Agent      │         │  Redis Stream        │         │  Backend         │
+│  Service    │         │  (agent:signals)     │         │  Service         │
+└──────┬──────┘         └──────────────────────┘         └────────┬─────────┘
+       │                                                          │
+       │  1. Publish APPROVE/REJECT                               │
+       │  ──────────────────────────────────────────────────────> │
+       │                                                          │
+       │                                                          │
+       │         ┌──────────────────────────────────────────────  │
+       │         │  Consumer polls every 5 seconds                │
+       │         │  ────────────────────────────────────────────> │
+       │         │                                                │
+       │         │  2. XREADGROUP with consumer group             │
+       │         │  3. Process signal                             │
+       │         │  4. Call orchestrator approveRun/rejectRun     │
+       │         │  5. XACK to acknowledge                        │
+       │         └──────────────────────────────────────────────  │
+       │                                                          │
+       │  6. Trigger next agent                                   │
+       │  ──────────────────────────────────────────────────────> │
+       │                                                          │
+       │  7. Publish COMPLETE or next task                        │
+       │  ──────────────────────────────────────────────────────> │
+       │                                                          │
+```
+
+### Implementation
+
+#### RedisStreamConfig.java
+
+```java
+@Configuration
+@Slf4j
+public class RedisStreamConfig {
+
+    /**
+     * Initializes the Redis Stream consumer group on application startup.
+     * Ensures the 'agent-consumers' group exists for reliable message delivery.
+     */
+    @Bean
+    public void initAgentSignalConsumerGroup(RedisTemplate<String, String> redisTemplate) {
+        String streamName = "agent:signals";
+        String groupName = "agent-consumers";
+        String consumerName = "backend-instance-1";
+
+        redisTemplate.execute(connection -> {
+            // Create consumer group if it doesn't exist
+            // '0' means start from latest messages for new consumers
+            return connection.xgroupCreate(
+                streamName.getBytes(),
+                groupName.getBytes(),
+                "0".getBytes(),
+                false // ignore existing group
+            );
+        });
     }
 }
 ```
 
-### Provider quick-reference for owners
+#### AgentSignal.java (DTO)
 
-| Provider | Mode | Base URL | Model name example |
-|---|---|---|---|
-| LM Studio (local) | API | `http://localhost:1234/v1` | `qwen3.5-35b` |
-| Ollama server (local) | API | `http://localhost:11434/v1` | `qwen3.5:35b` |
-| Ollama CLI (local) | CLI | — | command: `ollama run qwen3.5:35b` |
-| Alibaba Cloud | API | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-max` |
-| OpenAI | SDK | — | `gpt-4o` |
-| Anthropic | SDK | — | `claude-sonnet-4-6` |
-| llama.cpp | CLI | — | command: `/usr/local/bin/llama-cli -m /models/model.gguf` |
+```java
+@Data
+@Builder
+public class AgentSignal {
 
+    /** Unique signal ID for deduplication and tracking */
+    private UUID signalId;
+
+    /** Type of signal */
+    private SignalType signalType;
+
+    /** The AgentRun ID this signal relates to */
+    private UUID runId;
+
+    /** The Module ID this signal relates to */
+    private UUID moduleId;
+
+    /** The agent name this signal relates to */
+    private String agentName;
+
+    /** Additional data/context for the signal */
+    private Map<String, Object> data;
+
+    /** Timestamp when signal was created */
+    private LocalDateTime timestamp;
+
+    public enum SignalType {
+        APPROVE,      // Owner approved agent run
+        REJECT,       // Owner rejected agent run
+        COMPLETE,     // Agent completed (auto-trigger case)
+        RESUME        // Pipeline resume on restart
+    }
+
+    /** Create an APPROVE signal */
+    public static AgentSignal createApproveSignal(AgentRunInfo runInfo) {
+        return AgentSignal.builder()
+                .signalId(UUID.randomUUID())
+                .signalType(SignalType.APPROVE)
+                .runId(runInfo.runId())
+                .moduleId(runInfo.moduleId())
+                .agentName(runInfo.agentName())
+                .timestamp(LocalDateTime.now())
+                .build();
+    }
+
+    /** Create a REJECT signal with reason */
+    public static AgentSignal createRejectSignal(AgentRunInfo runInfo, String reason) {
+        return AgentSignal.builder()
+                .signalId(UUID.randomUUID())
+                .signalType(SignalType.REJECT)
+                .runId(runInfo.runId())
+                .moduleId(runInfo.moduleId())
+                .agentName(runInfo.agentName())
+                .data(Map.of("reason", reason))
+                .timestamp(LocalDateTime.now())
+                .build();
+    }
+
+    /** Create a COMPLETE signal (auto-trigger) */
+    public static AgentSignal createCompleteSignal(AgentRunInfo runInfo) {
+        return AgentSignal.builder()
+                .signalId(UUID.randomUUID())
+                .signalType(SignalType.COMPLETE)
+                .runId(runInfo.runId())
+                .moduleId(runInfo.moduleId())
+                .agentName(runInfo.agentName())
+                .timestamp(LocalDateTime.now())
+                .build();
+    }
+
+    /** Create a RESUME signal for pipeline recovery */
+    public static AgentSignal createResumeSignal(UUID moduleId, String reason) {
+        return AgentSignal.builder()
+                .signalId(UUID.randomUUID())
+                .signalType(SignalType.RESUME)
+                .moduleId(moduleId)
+                .data(Map.of("reason", reason))
+                .timestamp(LocalDateTime.now())
+                .build();
+    }
+
+    @lombok.Value
+    public static class AgentRunInfo {
+        UUID runId;
+        UUID moduleId;
+        String agentName;
+    }
+}
+```
+
+#### AgentSignalProducer.java
+
+```java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class AgentSignalProducer {
+
+    private final RedisTemplate<String, String> redisTemplate;
+    private static final String SIGNAL_STREAM_NAME = "agent:signals";
+    private static final long MAX_STREAM_ENTRIES = 10000;
+
+    /** Publish an APPROVE signal to the Redis Stream */
+    public void publishApproveSignal(Long runId, Long moduleId, String agentName) {
+        AgentSignal signal = AgentSignal.createApproveSignal(
+            new AgentSignal.AgentRunInfo(
+                java.util.UUID.fromString(Long.toString(runId)),
+                java.util.UUID.fromString(Long.toString(moduleId)),
+                agentName
+            )
+        );
+        publishSignal(signal);
+    }
+
+    /** Publish a REJECT signal to the Redis Stream */
+    public void publishRejectSignal(Long runId, Long moduleId, String agentName, String reason) {
+        AgentSignal signal = AgentSignal.createRejectSignal(
+            new AgentSignal.AgentRunInfo(
+                java.util.UUID.fromString(Long.toString(runId)),
+                java.util.UUID.fromString(Long.toString(moduleId)),
+                agentName
+            ),
+            reason
+        );
+        publishSignal(signal);
+    }
+
+    /** Publish a COMPLETE signal (auto-trigger case) */
+    public void publishCompleteSignal(Long runId, Long moduleId, String agentName) {
+        AgentSignal signal = AgentSignal.createCompleteSignal(
+            new AgentSignal.AgentRunInfo(
+                java.util.UUID.fromString(Long.toString(runId)),
+                java.util.UUID.fromString(Long.toString(moduleId)),
+                agentName
+            )
+        );
+        publishSignal(signal);
+    }
+
+    /** Publish a RESUME signal for pipeline recovery */
+    public void publishResumeSignal(Long moduleId, String reason) {
+        AgentSignal signal = AgentSignal.createResumeSignal(
+            java.util.UUID.fromString(Long.toString(moduleId)),
+            reason
+        );
+        publishSignal(signal);
+    }
+
+    /** Publish an arbitrary signal to the Redis Stream */
+    public void publishSignal(AgentSignal signal) {
+        try {
+            Map<String, Object> signalData = Map.of(
+                "signal_id", signal.getSignalId().toString(),
+                "signal_type", signal.getSignalType().name(),
+                "run_id", signal.getRunId() != null ? signal.getRunId().toString() : null,
+                "module_id", signal.getModuleId() != null ? signal.getModuleId().toString() : null,
+                "agent_name", signal.getAgentName(),
+                "timestamp", signal.getTimestamp() != null ? signal.getTimestamp().toString() : null,
+                "data", signal.getData() != null ? signal.getData() : Map.of()
+            );
+
+            // XADD with MAXLEN ~ to trim entries exceeding MAX_STREAM_ENTRIES
+            redisTemplate.execute(connection -> {
+                return connection.xadd(
+                    SIGNAL_STREAM_NAME.getBytes(),
+                    org.springframework.data.redis.connection.StreamOffset.create(
+                        SIGNAL_STREAM_NAME,
+                        org.springframework.data.redis.connection.StreamOffset.Position.LATEST
+                    ),
+                    signalData
+                );
+            });
+
+            log.debug("Published signal: type={}, runId={}, signalId={}",
+                    signal.getSignalType(), signal.getRunId(), signal.getSignalId());
+
+        } catch (Exception e) {
+            log.error("Failed to publish signal to Redis Stream: type={}, error={}",
+                    signal.getSignalType(), e.getMessage(), e);
+            // Don't throw - signal loss is better than failing the main operation
+        }
+    }
+
+    /** Get the count of unread messages in the stream */
+    public long getStreamLength() {
+        try {
+            Long length = redisTemplate.opsForStream().size(SIGNAL_STREAM_NAME);
+            return length != null ? length : 0;
+        } catch (Exception e) {
+            log.warn("Failed to get stream length: {}", e.getMessage());
+            return 0;
+        }
+    }
+}
+```
+
+#### AgentSignalConsumer.java
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class AgentSignalConsumer implements StreamListener<String, org.springframework.data.redis.connection.StreamMessage> {
+
+    private final RedisTemplate<String, String> redisTemplate;
+    private final AgentOrchestrator agentOrchestrator;
+
+    @Value("${agent.signal.poll.interval-ms:5000}")
+    private long pollIntervalMs;
+
+    @Value("${agent.signal.batch-size:10}")
+    private int batchSize;
+
+    // Track processed signal IDs to avoid duplicate processing
+    private final ConcurrentHashMap<UUID, LocalDateTime> processedSignals = new ConcurrentHashMap<>();
+    private static final long STALE_TIMEOUT_MINUTES = 60;
+
+    /**
+     * Poll for new signals every pollIntervalMs.
+     */
+    @Scheduled(fixedDelay = 5000)
+    public void pollSignals() {
+        try {
+            List<org.springframework.data.redis.connection.StreamMessage> messages = pollForMessages();
+
+            for (org.springframework.data.redis.connection.StreamMessage message : messages) {
+                processMessage(message);
+            }
+
+            cleanupStaleSignals();
+
+        } catch (Exception e) {
+            log.error("Error polling signals from Redis Stream: {}", e.getMessage(), e);
+        }
+    }
+
+    /** Poll for new messages from Redis Stream using XREADGROUP */
+    private List<org.springframework.data.redis.connection.StreamMessage> pollForMessages() {
+        try {
+            String streamName = "agent:signals";
+            String groupName = "agent-consumers";
+            String consumerName = "backend-instance-1";
+
+            Object result = redisTemplate.execute(connection -> {
+                return connection.xread(
+                    org.springframework.data.redis.connection.StreamOffset.create(
+                        streamName,
+                        org.springframework.data.redis.connection.StreamOffset.Position.CONSUMED,
+                        groupName,
+                        consumerName
+                    ),
+                    org.springframework.data.redis.connection.StreamReadOptions.empty(),
+                    batchSize
+                );
+            });
+
+            if (result == null || !(result instanceof List)) {
+                return List.of();
+            }
+
+            @SuppressWarnings("unchecked")
+            List<StreamMessages<String>> streamMessages = (List<StreamMessages<String>>) result;
+
+            if (streamMessages.isEmpty()) {
+                return List.of();
+            }
+
+            return streamMessages.get(0).getMessages();
+
+        } catch (Exception e) {
+            log.error("Error reading from Redis Stream: {}", e.getMessage(), e);
+            return List.of();
+        }
+    }
+
+    /** Process a single signal message */
+    private void processMessage(org.springframework.data.redis.connection.StreamMessage message) {
+        try {
+            Map<String, byte[]> data = message.getData();
+
+            // Parse signal ID
+            String signalIdStr = new String(data.get("signal_id"));
+            UUID signalId = UUID.fromString(signalIdStr);
+
+            // Check for duplicate processing
+            if (processedSignals.containsKey(signalId)) {
+                log.debug("Skipping duplicate signal: signalId={}", signalId);
+                return;
+            }
+
+            // Parse signal data
+            String signalTypeStr = new String(data.get("signal_type"));
+            AgentSignal.SignalType signalType = AgentSignal.SignalType.valueOf(signalTypeStr);
+
+            String runIdStr = new String(data.get("run_id"));
+            UUID runId = runIdStr != null && !runIdStr.isEmpty() 
+                ? UUID.fromString(runIdStr) 
+                : null;
+
+            String moduleIdStr = new String(data.get("module_id"));
+            UUID moduleId = moduleIdStr != null && !moduleIdStr.isEmpty() 
+                ? UUID.fromString(moduleIdStr) 
+                : null;
+
+            String agentName = new String(data.get("agent_name"));
+
+            LocalDateTime timestamp = LocalDateTime.now();
+
+            // Create signal object
+            AgentSignal signal = AgentSignal.builder()
+                    .signalId(signalId)
+                    .signalType(signalType)
+                    .runId(runId)
+                    .moduleId(moduleId)
+                    .agentName(agentName)
+                    .timestamp(timestamp)
+                    .build();
+
+            log.info("Processing signal: type={}, runId={}, moduleId={}, signalId={}",
+                    signalType, runId, moduleId, signalId);
+
+            // Process based on signal type
+            processSignal(signal);
+
+            // Mark as processed
+            processedSignals.put(signalId, LocalDateTime.now());
+
+            // Acknowledge processing
+            acknowledgeMessage(message.getId());
+
+        } catch (Exception e) {
+            log.error("Error processing signal message: {}", e.getMessage(), e);
+            // Don't acknowledge - message will be retried
+        }
+    }
+
+    /** Process a signal based on its type */
+    private void processSignal(AgentSignal signal) {
+        switch (signal.getSignalType()) {
+            case APPROVE:
+                processApproveSignal(signal);
+                break;
+            case REJECT:
+                processRejectSignal(signal);
+                break;
+            case COMPLETE:
+                processCompleteSignal(signal);
+                break;
+            case RESUME:
+                processResumeSignal(signal);
+                break;
+            default:
+                log.warn("Unknown signal type: {}", signal.getSignalType());
+        }
+    }
+
+    /** Process APPROVE signal - trigger next agent via orchestrator */
+    private void processApproveSignal(AgentSignal signal) {
+        if (signal.getRunId() == null) {
+            log.error("APPROVE signal missing runId: signalId={}", signal.getSignalId());
+            return;
+        }
+
+        log.info("Processing APPROVE signal for runId={}, signalId={}", 
+                signal.getRunId(), signal.getSignalId());
+        try {
+            agentOrchestrator.approveRun(signal.getRunId());
+            log.info("Successfully processed APPROVE signal: runId={}", signal.getRunId());
+        } catch (Exception e) {
+            log.error("Failed to process APPROVE signal for runId={}: {}", 
+                    signal.getRunId(), e.getMessage(), e);
+            // Signal remains unacknowledged for retry
+        }
+    }
+
+    /** Process REJECT signal - create retry and trigger next */
+    private void processRejectSignal(AgentSignal signal) {
+        if (signal.getRunId() == null) {
+            log.error("REJECT signal missing runId: signalId={}", signal.getSignalId());
+            return;
+        }
+
+        String reason = (String) signal.getData().getOrDefault("reason", "No reason provided");
+        log.info("Processing REJECT signal for runId={}, reason={}, signalId={}",
+                signal.getRunId(), reason, signal.getSignalId());
+        try {
+            agentOrchestrator.rejectRun(signal.getRunId(), reason);
+            log.info("Successfully processed REJECT signal: runId={}", signal.getRunId());
+        } catch (Exception e) {
+            log.error("Failed to process REJECT signal for runId={}: {}", 
+                    signal.getRunId(), e.getMessage(), e);
+            // Signal remains unacknowledged for retry
+        }
+    }
+
+    /** Process COMPLETE signal - trigger next agent (auto-trigger case) */
+    private void processCompleteSignal(AgentSignal signal) {
+        if (signal.getRunId() == null) {
+            log.error("COMPLETE signal missing runId: signalId={}", signal.getSignalId());
+            return;
+        }
+
+        log.info("Processing COMPLETE signal for runId={}, signalId={}", 
+                signal.getRunId(), signal.getSignalId());
+        // In auto-trigger mode, the next agent is already triggered via transaction sync
+        // This signal can be used for external monitoring/logging
+    }
+
+    /** Process RESUME signal - resume pipeline */
+    private void processResumeSignal(AgentSignal signal) {
+        if (signal.getModuleId() == null) {
+            log.error("RESUME signal missing moduleId: signalId={}", signal.getSignalId());
+            return;
+        }
+
+        String reason = (String) signal.getData().getOrDefault("reason", "Pipeline restart");
+        log.info("Processing RESUME signal for moduleId={}, reason={}, signalId={}",
+                signal.getModuleId(), reason, signal.getSignalId());
+
+        try {
+            agentOrchestrator.resumePipeline(signal.getModuleId());
+        } catch (Exception e) {
+            log.error("Failed to resume pipeline for moduleId={}: {}", 
+                    signal.getModuleId(), e.getMessage(), e);
+            // Signal remains unacknowledged for retry
+        }
+    }
+
+    /** Acknowledge message processing with XACK */
+    private void acknowledgeMessage(org.springframework.data.redis.connection.StreamId streamId) {
+        try {
+            String messageId = new String(streamId.getId());
+            redisTemplate.execute(connection -> {
+                return connection.xack(
+                    "agent:signals".getBytes(),
+                    "agent-consumers".getBytes(),
+                    messageId.getBytes()
+                );
+            });
+            log.trace("Acknowledged message: messageId={}", messageId);
+        } catch (Exception e) {
+            log.error("Failed to acknowledge message: {}", e.getMessage(), e);
+        }
+    }
+
+    /** Cleanup stale processed signal IDs */
+    private void cleanupStaleSignals() {
+        LocalDateTime now = LocalDateTime.now();
+        processedSignals.entrySet().removeIf(entry -> {
+            long minutesSinceProcessed = 
+                java.time.Duration.between(entry.getValue(), now).toMinutes();
+            if (minutesSinceProcessed > STALE_TIMEOUT_MINUTES) {
+                log.debug("Cleaning up stale signal ID: signalId={}", entry.getKey());
+                return true;
+            }
+            return false;
+        });
+    }
+}
+```
+
+#### AgentOrchestrator Integration
+
+```java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class AgentOrchestrator {
+    private final ModuleRepository moduleRepository;
+    private final AgentRunRepository agentRunRepository;
+    private final AgentSignalProducer agentSignalProducer;
+
+    /**
+     * Handles agent completion — publishes signal based on approval requirement.
+     */
+    public void handleAgentComplete(AgentCallbackDto callback) {
+        AgentRun run = agentRunRepository.findById(callback.getRunId()).orElseThrow();
+        run.setStatus(AgentRunStatus.COMPLETED);
+        run.setCompletedAt(LocalDateTime.now());
+        agentRunRepository.save(run);
+
+        if (Boolean.TRUE.equals(config.getApprovalRequired())) {
+            // Publish APPROVE signal for owner review
+            agentSignalProducer.publishApproveSignal(
+                run.getId().toString(),
+                run.getModule().getId().toString(),
+                run.getAgentName()
+            );
+        } else {
+            // Publish COMPLETE signal for auto-trigger next agent
+            agentSignalProducer.publishCompleteSignal(
+                run.getId().toString(),
+                run.getModule().getId().toString(),
+                run.getAgentName()
+            );
+        }
+    }
+
+    /** Handle approve signal */
+    public void approveRun(UUID runId) {
+        AgentRun run = agentRunRepository.findById(runId).orElseThrow();
+        run.setStatus(AgentRunStatus.APPROVED);
+        agentRunRepository.save(run);
+        
+        // Publish APPROVE signal
+        agentSignalProducer.publishApproveSignal(
+            run.getId().toString(),
+            run.getModule().getId().toString(),
+            run.getAgentName()
+        );
+        
+        triggerNextAgent(run.getModule());
+    }
+
+    /** Handle reject signal */
+    public void rejectRun(UUID runId, String reason) {
+        AgentRun run = agentRunRepository.findById(runId).orElseThrow();
+        run.setStatus(AgentRunStatus.REJECTED);
+        agentRunRepository.save(run);
+        
+        // Publish REJECT signal
+        agentSignalProducer.publishRejectSignal(
+            run.getId().toString(),
+            run.getModule().getId().toString(),
+            run.getAgentName(),
+            reason
+        );
+        
+        sseService.broadcastRunRejected(runId, reason);
+    }
+}
+```
+
+### Configuration Properties
+
+```yaml
+# application.yml
+agent:
+  signal:
+    poll-interval-ms: 5000      # How often consumer polls Redis (default: 5000ms)
+    batch-size: 10               # Max messages to read per poll (default: 10)
+```
+
+### Unit Tests
+
+See `AgentSignalTest.java` for comprehensive unit tests covering:
+- Signal creation (APPROVE, REJECT, COMPLETE, RESUME)
+- Signal publishing to Redis Stream
+- Stream length monitoring
+- Error handling

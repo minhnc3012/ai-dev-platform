@@ -2,7 +2,7 @@ package com.aidevplatform.api.dto;
 
 import lombok.Data;
 
-import java.util.Map;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.util.UUID;
 
 /**
@@ -14,6 +14,6 @@ public class AgentEventRequest {
     private UUID runId;
     private String eventType;
     private String message;
-    private Map<String, Object> payload;
+    private ObjectNode payload;
     private String timestamp;
 }
