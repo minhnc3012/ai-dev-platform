@@ -1,5 +1,26 @@
+# Virtual environments
 agent/venv
 backend/venv
-backend/target
+
+# Build artifacts
+backend/target/**
+**/*.class
+
+# Python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# IDE
+.idea/
+*.iml
+
+# Agent runtime data
+agent/.knowledge/
+
+# Local utility scripts
+backend/kill8080.bat
+
+# Java project metadata
 .classpath
 .factorypath
