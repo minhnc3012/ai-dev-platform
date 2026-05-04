@@ -3,6 +3,7 @@ package com.aidevplatform.domain.entity;
 import com.aidevplatform.domain.enums.ProjectStatus;
 import jakarta.persistence.*;
 import lombok.*;
+import lombok.Builder.Default;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -33,6 +34,7 @@ public class Project extends BaseEntity {
     private AiConfig aiConfig;
 
     @Enumerated(EnumType.STRING)
+    @Default
     private ProjectStatus status = ProjectStatus.ACTIVE;
 
     private String gitRepoUrl;
@@ -43,8 +45,10 @@ public class Project extends BaseEntity {
     private String workspacePath;
 
     @OneToMany(mappedBy = "project", cascade = CascadeType.ALL)
+    @Default
     private List<Module> modules = new ArrayList<>();
 
     @OneToMany(mappedBy = "project", cascade = CascadeType.ALL)
+    @Default
     private List<ProjectContextDoc> contextDocs = new ArrayList<>();
 }

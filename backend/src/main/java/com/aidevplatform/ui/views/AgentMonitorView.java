@@ -1,20 +1,27 @@
 package com.aidevplatform.ui.views;
 
 import com.aidevplatform.api.dto.AgentEventDto;
+import com.aidevplatform.domain.entity.AgentChatMessage;
 import com.aidevplatform.domain.entity.AgentReport;
 import com.aidevplatform.domain.entity.AgentRun;
+import com.aidevplatform.domain.entity.AgentTemplate;
 import com.aidevplatform.domain.entity.Module;
+import com.aidevplatform.domain.entity.WorkflowDefinition;
 import com.aidevplatform.domain.enums.AgentRunStatus;
 import com.aidevplatform.domain.model.Deliverable;
 import com.aidevplatform.domain.model.Issue;
 import com.aidevplatform.domain.model.OwnerDecision;
+import com.aidevplatform.domain.model.WorkflowStage;
 import com.aidevplatform.repository.AgentEventRepository;
 import com.aidevplatform.repository.AgentRunRepository;
+import com.aidevplatform.repository.AgentTemplateRepository;
+import com.aidevplatform.service.AgentChatService;
 import com.aidevplatform.service.AgentOrchestrator;
 import com.aidevplatform.service.FileStorageService;
 import com.aidevplatform.service.ModuleService;
 import com.aidevplatform.service.ReportService;
 import com.aidevplatform.service.UiEventBroadcaster;
+import com.aidevplatform.service.WorkflowService;
 import com.aidevplatform.ui.MainLayout;
 import com.aidevplatform.ui.components.AgentLogPanel;
 import com.vaadin.flow.component.AttachEvent;
@@ -79,9 +86,14 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
     private final AgentOrchestrator agentOrchestrator;
     private final FileStorageService fileStorageService;
     private final UiEventBroadcaster uiEventBroadcaster;
+    private final AgentChatService agentChatService;
+    private final WorkflowService workflowService;
+    private final AgentTemplateRepository agentTemplateRepository;
 
     // ── State ─────────────────────────────────────────────────────────────────
     private UUID moduleId;
+    private UUID projectId;
+    private UUID workflowId;
     private UUID broadcastRegistrationId;
     private Registration pollRegistration;
     private String selectedAgent; // agent whose report is shown in the Report tab
@@ -97,6 +109,7 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
         Div progressWrap;
     }
     private final Map<String, RowRefs> rowMap = new LinkedHashMap<>();
+    private final Map<String, AgentRunStatus> lastPolledStatus = new HashMap<>();
 
     // ── Panel / tab refs ──────────────────────────────────────────────────────
     private Span summaryRunning;
@@ -117,7 +130,10 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
                              ReportService reportService,
                              AgentOrchestrator agentOrchestrator,
                              FileStorageService fileStorageService,
-                             UiEventBroadcaster uiEventBroadcaster) {
+                             UiEventBroadcaster uiEventBroadcaster,
+                             AgentChatService agentChatService,
+                             WorkflowService workflowService,
+                             AgentTemplateRepository agentTemplateRepository) {
         this.moduleService = moduleService;
         this.agentRunRepository = agentRunRepository;
         this.agentEventRepository = agentEventRepository;
@@ -125,6 +141,9 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
         this.agentOrchestrator = agentOrchestrator;
         this.fileStorageService = fileStorageService;
         this.uiEventBroadcaster = uiEventBroadcaster;
+        this.agentChatService = agentChatService;
+        this.workflowService = workflowService;
+        this.agentTemplateRepository = agentTemplateRepository;
 
         setSizeFull();
         setPadding(false);
@@ -212,6 +231,8 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
         selectedAgent = null;
 
         Module module = moduleService.findByIdWithDetails(moduleId);
+        if (module.getProject() != null) projectId = module.getProject().getId();
+        workflowId = module.getWorkflowId();
 
         // ── Header ────────────────────────────────────────────────────────────
         add(buildHeaderBar(module));
@@ -325,17 +346,112 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
         pane.setSizeFull();
         pane.setPadding(true);
         pane.setSpacing(false);
-        pane.getStyle().set("overflow-y", "auto").set("gap", "6px");
+        pane.getStyle().set("overflow-y", "auto").set("gap", "8px");
 
-        List<String> active = module.getProject().getAiConfig() != null
-                ? module.getProject().getAiConfig().getActiveAgents()
-                : PIPELINE;
+        if (module.getWorkflowId() != null) {
+            try {
+                WorkflowDefinition workflow = workflowService.getById(module.getWorkflowId());
 
-        PIPELINE.stream()
-                .filter(active::contains)
-                .forEach(name -> pane.add(buildAgentRow(name)));
+                Map<String, AgentTemplate> templateMap = projectId != null
+                        ? agentTemplateRepository.findByProjectId(projectId).stream()
+                                .collect(Collectors.toMap(t -> t.getId().toString(), t -> t))
+                        : Map.of();
+
+                // Map stageId → latest run for that stage
+                Map<String, AgentRun> runByStageId = agentRunRepository
+                        .findByModuleIdOrderByRunOrderAsc(moduleId).stream()
+                        .collect(Collectors.toMap(
+                                AgentRun::getStageId, r -> r, (a, b) -> b));
+
+                for (WorkflowStage stage : workflow.getStages()) {
+                    pane.add(buildStageSection(stage, templateMap, runByStageId));
+                }
+            } catch (Exception e) {
+                log.error("Failed to build workflow stage monitor: {}", e.getMessage());
+                agentRunRepository.findByModuleIdOrderByRunOrderAsc(moduleId).stream()
+                        .map(AgentRun::getAgentName).distinct()
+                        .forEach(name -> pane.add(buildAgentRow(name)));
+            }
+        } else {
+            PIPELINE.forEach(name -> pane.add(buildAgentRow(name)));
+        }
 
         return pane;
+    }
+
+    private Div buildStageSection(WorkflowStage stage, Map<String, AgentTemplate> templateMap,
+                                   Map<String, AgentRun> runByStageId) {
+        Div section = new Div();
+        section.getStyle()
+                .set("background", BG_CARD).set("border", BORDER).set("border-radius", "10px")
+                .set("overflow", "hidden");
+
+        // ── Stage header ──────────────────────────────────────────────────────
+        Div stageHeader = new Div();
+        stageHeader.getStyle()
+                .set("padding", "6px 14px").set("background", "#f5f4ef")
+                .set("border-bottom", BORDER).set("display", "flex")
+                .set("align-items", "center").set("gap", "8px");
+
+        Span stageName = new Span(stage.getName() != null ? stage.getName() : "Stage");
+        stageName.getStyle()
+                .set("font-size", "11px").set("font-weight", "700")
+                .set("color", TEXT_SEC).set("text-transform", "uppercase")
+                .set("letter-spacing", "0.07em");
+        stageHeader.add(stageName);
+
+        if ("parallel".equals(stage.getType()) && stage.getChildren() != null
+                && stage.getChildren().size() > 1) {
+            Span pb = new Span("⟳ parallel");
+            pb.getStyle().set("font-size", "10px").set("background", "#e6f9ee")
+                    .set("color", "#1e7e3e").set("padding", "1px 6px")
+                    .set("border-radius", "8px").set("font-weight", "500");
+            stageHeader.add(pb);
+        }
+        if (Boolean.TRUE.equals(stage.getPauseForReview())) {
+            Span rb = new Span("⊙ review");
+            rb.getStyle().set("font-size", "10px").set("background", "#fff3cd")
+                    .set("color", "#856404").set("padding", "1px 6px")
+                    .set("border-radius", "8px").set("margin-left", "auto");
+            stageHeader.add(rb);
+        }
+        section.add(stageHeader);
+
+        // ── Agent rows ────────────────────────────────────────────────────────
+        if ("parallel".equals(stage.getType()) && stage.getChildren() != null) {
+            for (WorkflowStage child : stage.getChildren()) {
+                String agentName = resolveAgentNameForStage(child, templateMap, runByStageId);
+                section.add(buildEmbeddedAgentRow(agentName));
+            }
+        } else {
+            String agentName = resolveAgentNameForStage(stage, templateMap, runByStageId);
+            section.add(buildEmbeddedAgentRow(agentName));
+        }
+
+        return section;
+    }
+
+    private String resolveAgentNameForStage(WorkflowStage stage,
+                                             Map<String, AgentTemplate> templateMap,
+                                             Map<String, AgentRun> runByStageId) {
+        AgentRun run = runByStageId.get(stage.getId());
+        if (run != null) return run.getAgentName();
+        if (stage.getAgentTemplateId() != null) {
+            AgentTemplate t = templateMap.get(stage.getAgentTemplateId());
+            if (t != null) return t.getName();
+        }
+        return stage.getName() != null ? stage.getName() : "Agent";
+    }
+
+    /** Agent row embedded inside a stage section — no outer card border. */
+    private Div buildEmbeddedAgentRow(String agentName) {
+        Div row = buildAgentRow(agentName);
+        row.getStyle().remove("border").remove("border-radius").remove("box-shadow")
+                .set("border-bottom", BORDER).set("border-radius", "0");
+        row.getElement().executeJs(
+                "this.addEventListener('mouseenter',()=>this.style.background='#fafaf7');" +
+                "this.addEventListener('mouseleave',()=>this.style.background='');");
+        return row;
     }
 
     private Div buildAgentRow(String agentName) {
@@ -499,6 +615,12 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
             runs.forEach(run -> {
                 RowRefs refs = rowMap.get(run.getAgentName());
                 if (refs != null) updateRowFromRun(refs, run);
+
+                // If the selected agent's status changed since last poll, refresh the report pane
+                AgentRunStatus prev = lastPolledStatus.put(run.getAgentName(), run.getStatus());
+                if (run.getAgentName().equals(selectedAgent) && run.getStatus() != prev) {
+                    refreshReportPane(run);
+                }
             });
             updateSummaryBadges(runs);
 
@@ -666,53 +788,103 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
         // Log status for debugging
         log.info("Refreshing report for run {} (agent: {}, status: {}, has report: true, reportId: {})",
                 currentRun.getId(), currentRun.getAgentName(), currentRun.getStatus(), report.getId());
-        reportPane.add(buildReportCard(currentRun, report));
+        reportPane.add(buildReportLayout(currentRun, report, isLastWorkflowStage(currentRun)));
     }
 
-    /**
-     * Builds the styled report card matching agent_monitor_mockup.html §Report panel.
-     */
-    private Div buildReportCard(AgentRun run, AgentReport report) {
-        Div card = new Div();
-        card.getStyle()
-                .set("background", BG_CARD)
-                .set("border", BORDER)
-                .set("border-radius", "12px")
-                .set("padding", "16px 18px");
+    // ── Report layout (three-panel: approval banner + left report + right files/chat) ──
 
-        // ── Header: name + confidence bar ─────────────────────────────────────
+    private Div buildReportLayout(AgentRun run, AgentReport report, boolean isLastStage) {
+        // Outer wrapper: plain Div, vertical stack
+        Div layout = new Div();
+        layout.getStyle()
+                .set("width", "100%").set("display", "flex")
+                .set("flex-direction", "column").set("gap", "14px")
+                .set("box-sizing", "border-box");
+
+        if (run.getStatus() == AgentRunStatus.AWAITING_APPROVAL) {
+            layout.add(buildApprovalBanner(run.getId(), isLastStage));
+        }
+
+        // Two-column row — use explicit percentages so columns never bleed into each other
+        Div body = new Div();
+        body.getStyle()
+                .set("width", "100%").set("display", "flex")
+                .set("flex-direction", "row").set("gap", "14px")
+                .set("align-items", "stretch").set("box-sizing", "border-box");
+
+        boolean hasFiles = report.getDeliverables() != null
+                && report.getDeliverables().stream()
+                        .anyMatch(d -> d.getFilePath() != null && !d.getFilePath().isBlank());
+        // APPROVED shows read-only history; AWAITING_APPROVAL and COMPLETED allow sending
+        boolean canChat = run.getStatus() == AgentRunStatus.AWAITING_APPROVAL
+                || run.getStatus() == AgentRunStatus.COMPLETED
+                || run.getStatus() == AgentRunStatus.APPROVED;
+
+        // Left column: report card + chat card stacked
+        Div leftCol = new Div();
+        leftCol.getStyle()
+                .set("flex", "0 0 calc(60% - 7px)")
+                .set("max-width", "calc(60% - 7px)")
+                .set("box-sizing", "border-box").set("overflow", "hidden")
+                .set("display", "flex").set("flex-direction", "column").set("gap", "14px");
+        leftCol.add(buildReportInfoCard(run, report));
+        if (canChat) leftCol.add(buildChatCard(run));
+        body.add(leftCol);
+
+        // Right column: output files only — flex column so card fills to bottom
+        if (hasFiles) {
+            Div rightCol = new Div();
+            rightCol.getStyle()
+                    .set("flex", "0 0 calc(40% - 7px)")
+                    .set("max-width", "calc(40% - 7px)")
+                    .set("box-sizing", "border-box").set("overflow", "hidden")
+                    .set("display", "flex").set("flex-direction", "column");
+            rightCol.add(buildFilesCard(report));
+            body.add(rightCol);
+        }
+
+        layout.add(body);
+        return layout;
+    }
+
+    private Div buildReportInfoCard(AgentRun run, AgentReport report) {
+        Div card = new Div();
+        card.setWidthFull();
+        card.getStyle()
+                .set("background", BG_CARD).set("border", BORDER)
+                .set("border-radius", "10px").set("padding", "16px 18px");
+
+        // Header: agent name + status badge + confidence bar
         HorizontalLayout header = new HorizontalLayout();
         header.setAlignItems(FlexComponent.Alignment.CENTER);
         header.setWidthFull();
+        header.setPadding(false);
         header.setSpacing(false);
-        header.getStyle().set("gap", "12px").set("margin-bottom", "12px");
+        header.getStyle().set("gap", "10px").set("margin-bottom", "12px");
 
-        Span agentTitle = new Span(resolveDisplayName(run.getAgentName()) + " — report");
-        agentTitle.getStyle().set("font-size", "15px").set("font-weight", "500").set("flex", "1");
+        Span agentTitle = new Span(resolveDisplayName(run.getAgentName()));
+        agentTitle.getStyle().set("font-size", "14px").set("font-weight", "600").set("flex", "1");
+
+        Span statusBadge = new Span(resolveBadgeText(run.getStatus()));
+        applyInlineBadgeStyle(statusBadge, run.getStatus());
+        statusBadge.getStyle().set("font-size", "11px").set("padding", "2px 8px")
+                .set("border-radius", "999px").set("font-weight", "500").set("flex-shrink", "0");
+        header.add(agentTitle, statusBadge);
 
         if (report.getConfidenceScore() != null) {
             double pct = report.getConfidenceScore().doubleValue();
-
             Div barWrap = new Div();
-            barWrap.getStyle()
-                    .set("width", "120px").set("height", "6px")
-                    .set("background", "#e2e0d8").set("border-radius", "3px");
-
+            barWrap.getStyle().set("width", "80px").set("height", "5px")
+                    .set("background", "#e2e0d8").set("border-radius", "3px").set("flex-shrink", "0");
             Div barFill = new Div();
-            barFill.getStyle()
-                    .set("height", "6px").set("border-radius", "3px")
+            barFill.getStyle().set("height", "5px").set("border-radius", "3px")
                     .set("width", (int) pct + "%")
                     .set("background", pct >= 70 ? "#639922" : "#BA7517");
             barWrap.add(barFill);
-
             Span pctLbl = new Span((int) pct + "%");
-            pctLbl.getStyle()
-                    .set("font-size", "12px").set("font-weight", "500")
-                    .set("color", pct >= 70 ? "#27500A" : "#633806");
-
-            header.add(agentTitle, barWrap, pctLbl);
-        } else {
-            header.add(agentTitle);
+            pctLbl.getStyle().set("font-size", "11px").set("font-weight", "500")
+                    .set("color", pct >= 70 ? "#27500A" : "#633806").set("flex-shrink", "0");
+            header.add(barWrap, pctLbl);
         }
         card.add(header);
 
@@ -803,24 +975,229 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
             card.add(reason);
         }
 
-        // ── Approve / Reject (only when AWAITING_APPROVAL) ────────────────────
-        log.info("buildReportCard: runId={}, agent={}, status={}, showApproveBtn={}",
-                run.getId(), run.getAgentName(), run.getStatus(),
-                run.getStatus() == AgentRunStatus.AWAITING_APPROVAL);
-
-        // Show status-appropriate message
-        if (run.getStatus() == AgentRunStatus.AWAITING_APPROVAL) {
-            log.info("Adding approve/reject buttons for run {}", run.getId());
-            card.add(buildApprovalRow(run.getId()));
-        } else {
-            // Show clear status message based on current state
+        // Status footer (approval state is shown in the banner above, not here)
+        if (run.getStatus() != AgentRunStatus.AWAITING_APPROVAL) {
+            Div footer = new Div();
+            footer.getStyle().set("padding-top", "10px").set("border-top", "0.5px solid #e2e0d8")
+                    .set("margin-top", "4px");
             Span statusMsg = new Span(resolveStatusMessage(run));
-            statusMsg.getStyle().set("font-size", "12px").set("color", "var(--lumo-secondary-text-color)")
-                    .set("margin-top", "10px").set("font-style", "italic");
-            card.add(statusMsg);
+            statusMsg.getStyle().set("font-size", "11px").set("color", TEXT_SEC)
+                    .set("font-style", "italic");
+            footer.add(statusMsg);
+            card.add(footer);
         }
 
         return card;
+    }
+
+    private Div buildFilesCard(AgentReport report) {
+        // Card stretches to fill the right column height (align-items: stretch on parent)
+        Div card = new Div();
+        card.getStyle()
+                .set("background", BG_CARD).set("border", BORDER)
+                .set("border-radius", "10px").set("padding", "14px 16px")
+                .set("display", "flex").set("flex-direction", "column")
+                .set("flex", "1").set("min-height", "0").set("box-sizing", "border-box");
+
+        card.add(buildSectionLabel("Output Files"));
+
+        List<Deliverable> files = report.getDeliverables().stream()
+                .filter(d -> d.getFilePath() != null && !d.getFilePath().isBlank())
+                .toList();
+
+        // Wrapper fills remaining card height and shares it equally across files
+        Div filesWrapper = new Div();
+        filesWrapper.getStyle()
+                .set("display", "flex").set("flex-direction", "column")
+                .set("flex", "1").set("min-height", "0").set("gap", "14px");
+
+        for (Deliverable d : files) {
+            String rawPath = d.getFilePath();
+            String fileName = d.getName() != null ? d.getName() : rawPath;
+            try { fileName = java.nio.file.Paths.get(rawPath).getFileName().toString(); } catch (Exception ignored) {}
+
+            // Each file block is a flex column that shares the wrapper height equally
+            Div fileBlock = new Div();
+            fileBlock.getStyle()
+                    .set("display", "flex").set("flex-direction", "column")
+                    .set("flex", "1").set("min-height", "0");
+
+            // File header: type badge + name + line count
+            Div fileHeader = new Div();
+            fileHeader.getStyle()
+                    .set("display", "flex").set("align-items", "center")
+                    .set("gap", "8px").set("margin-bottom", "6px").set("flex-shrink", "0");
+
+            Span typeTag = new Span(d.getType() != null ? d.getType() : "file");
+            typeTag.getStyle().set("font-size", "10px").set("padding", "1px 6px")
+                    .set("border-radius", "4px").set("background", resolveDeliverableIconColor(d.getType()))
+                    .set("color", "#534AB7").set("font-weight", "600").set("flex-shrink", "0");
+
+            Span nameSpan = new Span(fileName);
+            nameSpan.getStyle().set("font-size", "12px").set("font-weight", "500")
+                    .set("color", TEXT_PRI).set("flex", "1")
+                    .set("overflow", "hidden").set("text-overflow", "ellipsis").set("white-space", "nowrap");
+
+            fileHeader.add(typeTag, nameSpan);
+            if (d.getLines() != null && d.getLines() > 0) {
+                Span linesLbl = new Span(d.getLines() + " lines");
+                linesLbl.getStyle().set("font-size", "10px").set("color", TEXT_SEC).set("flex-shrink", "0");
+                fileHeader.add(linesLbl);
+            }
+            fileBlock.add(fileHeader);
+
+            // Editable TextArea — fills remaining block height
+            TextArea editor = new TextArea();
+            editor.setWidthFull();
+            editor.getStyle()
+                    .set("font-family", "'Courier New', monospace").set("font-size", "11px")
+                    .set("flex", "1").set("min-height", "200px");
+
+            try {
+                editor.setValue(fileStorageService.downloadAsString(rawPath));
+            } catch (Exception ex) {
+                editor.setValue("// Cannot read file: " + ex.getMessage());
+            }
+            fileBlock.add(editor);
+
+            // Save button — below editor, aligned right
+            final String filePath = rawPath;
+            Button saveBtn = new Button("Save", e -> {
+                try {
+                    fileStorageService.saveContent(filePath, editor.getValue());
+                    Notification.show("Saved successfully",
+                            2000, Notification.Position.BOTTOM_CENTER)
+                            .addThemeVariants(NotificationVariant.LUMO_SUCCESS);
+                } catch (Exception ex) {
+                    Notification.show("Save failed: " + ex.getMessage(),
+                            3000, Notification.Position.BOTTOM_CENTER)
+                            .addThemeVariants(NotificationVariant.LUMO_ERROR);
+                }
+            });
+            saveBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_PRIMARY);
+
+            Div saveRow = new Div(saveBtn);
+            saveRow.getStyle()
+                    .set("display", "flex").set("justify-content", "flex-end")
+                    .set("margin-top", "6px").set("flex-shrink", "0");
+            fileBlock.add(saveRow);
+
+            // Separator between files
+            if (files.indexOf(d) < files.size() - 1) {
+                fileBlock.getStyle().set("padding-bottom", "14px")
+                        .set("border-bottom", "0.5px solid #e2e0d8");
+            }
+
+            filesWrapper.add(fileBlock);
+        }
+
+        card.add(filesWrapper);
+        return card;
+    }
+
+    private Div buildChatCard(AgentRun run) {
+        Div card = new Div();
+        card.setWidthFull();
+        card.getStyle()
+                .set("background", BG_CARD).set("border", BORDER)
+                .set("border-radius", "10px").set("padding", "14px 16px");
+
+        AgentRunStatus status = run.getStatus();
+        boolean isAwaiting = status == AgentRunStatus.AWAITING_APPROVAL;
+        boolean canSend = status == AgentRunStatus.AWAITING_APPROVAL
+                || status == AgentRunStatus.COMPLETED;
+
+        String cardTitle = isAwaiting ? "Request Revision" : "Conversation";
+        card.add(buildSectionLabel(cardTitle));
+
+        VerticalLayout historyBox = new VerticalLayout();
+        historyBox.setPadding(false);
+        historyBox.setSpacing(false);
+        historyBox.setWidthFull();
+        historyBox.getStyle().set("gap", "4px").set("max-height", "220px")
+                .set("overflow-y", "auto").set("margin-bottom", "10px");
+
+        List<AgentChatMessage> history = List.of();
+        try { history = agentChatService.getChatHistory(run.getId()); } catch (Exception ignored) {}
+
+        if (history.isEmpty()) {
+            String emptyText = isAwaiting
+                    ? "Send feedback to request a revision before approving."
+                    : canSend ? "No conversation yet."
+                    : "No conversation for this run.";
+            Span empty = new Span(emptyText);
+            empty.getStyle().set("font-size", "11px").set("color", TEXT_SEC)
+                    .set("font-style", "italic").set("padding", "2px 0");
+            historyBox.add(empty);
+        } else {
+            for (AgentChatMessage msg : history) historyBox.add(buildChatBubble(msg));
+        }
+        card.add(historyBox);
+
+        // Input only when re-run is allowed (not for APPROVED — pipeline already moved on)
+        if (canSend) {
+            TextArea inputField = new TextArea();
+            inputField.setPlaceholder(isAwaiting
+                    ? "Describe what needs to change…" : "Ask the agent something…");
+            inputField.setWidthFull();
+            inputField.setMinHeight("72px");
+            inputField.getStyle().set("font-size", "12px");
+
+            Button sendBtn = new Button(isAwaiting ? "Send & Re-run" : "Send & Re-run");
+            sendBtn.addThemeVariants(ButtonVariant.LUMO_PRIMARY, ButtonVariant.LUMO_SMALL);
+
+            final VerticalLayout historyRef = historyBox;
+            sendBtn.addClickListener(e -> {
+                String msg = inputField.getValue().trim();
+                if (msg.isEmpty()) return;
+                try {
+                    agentChatService.sendFeedback(run.getId(), msg);
+                    inputField.clear();
+                    Div bubble = new Div();
+                    bubble.getStyle().set("padding", "5px 10px").set("border-radius", "6px")
+                            .set("font-size", "12px").set("line-height", "1.5")
+                            .set("background", "#dbeafe").set("color", "#1e40af").set("margin-left", "16px");
+                    bubble.setText("You: " + msg);
+                    historyRef.add(bubble);
+                    Notification.show("Feedback sent — agent is re-running",
+                            3000, Notification.Position.BOTTOM_CENTER)
+                            .addThemeVariants(NotificationVariant.LUMO_SUCCESS);
+                } catch (Exception ex) {
+                    Notification.show("Failed: " + ex.getMessage(), 3000, Notification.Position.BOTTOM_CENTER)
+                            .addThemeVariants(NotificationVariant.LUMO_ERROR);
+                }
+            });
+
+            Div btnRow = new Div(sendBtn);
+            btnRow.getStyle()
+                    .set("display", "flex").set("justify-content", "flex-end")
+                    .set("margin-top", "6px");
+
+            card.add(inputField, btnRow);
+        } else {
+            // APPROVED: read-only — pipeline already moved on, re-run not applicable
+            Span readOnly = new Span("Pipeline has moved on — conversation is read-only.");
+            readOnly.getStyle().set("font-size", "11px").set("color", TEXT_SEC)
+                    .set("font-style", "italic");
+            card.add(readOnly);
+        }
+        return card;
+    }
+
+    private Div buildChatBubble(AgentChatMessage msg) {
+        Div bubble = new Div();
+        bubble.getStyle().set("padding", "5px 10px").set("border-radius", "6px")
+                .set("font-size", "12px").set("line-height", "1.5");
+        if ("user".equals(msg.getRole())) {
+            bubble.getStyle().set("background", "#dbeafe").set("color", "#1e40af")
+                    .set("margin-left", "16px");
+            bubble.setText("You: " + msg.getContent());
+        } else {
+            bubble.getStyle().set("background", "#f4f4f4").set("color", TEXT_PRI)
+                    .set("border", "0.5px solid #e2e0d8");
+            bubble.setText("Agent: " + msg.getContent());
+        }
+        return bubble;
     }
 
     private Span buildSectionLabel(String text) {
@@ -850,27 +1227,58 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
         };
     }
 
-    private HorizontalLayout buildApprovalRow(UUID runId) {
-        HorizontalLayout row = new HorizontalLayout();
-        row.setSpacing(false);
-        row.getStyle()
-                .set("gap", "8px").set("margin-top", "14px")
-                .set("padding-top", "12px").set("border-top", "0.5px solid #e2e0d8");
+    private boolean isLastWorkflowStage(AgentRun run) {
+        if (workflowId == null || run.getStageId() == null) return false;
+        try {
+            WorkflowDefinition workflow = workflowService.getById(workflowId);
+            List<WorkflowStage> stages = workflow.getStages();
+            if (stages == null || stages.isEmpty()) return false;
+            return stageContainsId(stages.get(stages.size() - 1), run.getStageId());
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
-        Button approveBtn = new Button("Approve — run next agent", e -> onApprove(runId));
+    private boolean stageContainsId(WorkflowStage stage, String stageId) {
+        if (stageId.equals(stage.getId())) return true;
+        if (stage.getChildren() != null) {
+            return stage.getChildren().stream().anyMatch(c -> stageContainsId(c, stageId));
+        }
+        return false;
+    }
+
+    private Div buildApprovalBanner(UUID runId, boolean isLastStage) {
+        Div banner = new Div();
+        banner.setWidthFull();
+        banner.getStyle()
+                .set("background", "#FFFBF0").set("border", "1.5px solid #BA7517")
+                .set("border-radius", "10px").set("padding", "14px 18px")
+                .set("display", "flex").set("align-items", "center").set("gap", "12px");
+
+        Div textGroup = new Div();
+        textGroup.getStyle().set("flex", "1");
+        Span title = new Span("Review required");
+        title.getStyle().set("font-size", "13px").set("font-weight", "600")
+                .set("color", "#633806").set("display", "block").set("margin-bottom", "2px");
+        Span hint = new Span("Review the report and output files, then approve or request a revision via chat.");
+        hint.getStyle().set("font-size", "11px").set("color", "#856320");
+        textGroup.add(title, hint);
+
+        String approveLabel = isLastStage ? "Approve — mark as completed" : "Approve — run next agent";
+        Button approveBtn = new Button(approveLabel, e -> onApprove(runId));
         approveBtn.getStyle()
                 .set("background", "#EAF3DE").set("color", "#27500A")
                 .set("border", "1px solid #97C459").set("border-radius", "6px")
-                .set("font-size", "13px").set("font-weight", "500").set("cursor", "pointer");
+                .set("font-size", "13px").set("font-weight", "500").set("white-space", "nowrap");
 
         Button rejectBtn = new Button("Reject", e -> openRejectDialog(runId));
         rejectBtn.getStyle()
                 .set("background", "transparent").set("color", "#791F1F")
                 .set("border", "1px solid #F09595").set("border-radius", "6px")
-                .set("font-size", "13px").set("font-weight", "500").set("cursor", "pointer");
+                .set("font-size", "13px").set("font-weight", "500");
 
-        row.add(approveBtn, rejectBtn);
-        return row;
+        banner.add(textGroup, approveBtn, rejectBtn);
+        return banner;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -923,9 +1331,8 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
         }
 
         // 5. If the currently shown report is for this agent and it just completed, refresh it
-        if (agentName.equals(selectedAgent)
-                && ("COMPLETED".equals(event.getEventType())
-                || "AWAITING_APPROVAL".equals(event.getEventType()))) {
+        // (AWAITING_APPROVAL is already handled by block 4 above — exclude it to avoid double refresh)
+        if (agentName.equals(selectedAgent) && "COMPLETED".equals(event.getEventType())) {
             try {
                 // Use findAllByModuleIdWithReportAndRun to load report relationship
                 List<AgentRun> runs = agentRunRepository.findAllByModuleIdWithReportAndRun(moduleId);
@@ -984,12 +1391,16 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
     private void onApprove(UUID runId) {
         try {
             agentOrchestrator.approveRun(runId);
-            // Reload the report pane to hide the approval buttons
             try {
-                // Use findAllByModuleIdWithReportAndRun to load report relationship
                 List<AgentRun> runs = agentRunRepository.findAllByModuleIdWithReportAndRun(moduleId);
                 runs.stream().filter(r -> r.getId().equals(runId)).findFirst()
-                        .ifPresent(this::refreshReportPane);
+                        .ifPresent(run -> {
+                            refreshReportPane(run);
+                            RowRefs refs = rowMap.get(run.getAgentName());
+                            if (refs != null) updateRowFromRun(refs, run);
+                            lastPolledStatus.put(run.getAgentName(), run.getStatus());
+                            updateSummaryBadges(runs);
+                        });
             } catch (Exception ignored) {}
             Notification.show("Run approved — next agent is starting",
                     3000, Notification.Position.BOTTOM_CENTER)
@@ -1017,10 +1428,15 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
             if (reason.isEmpty()) { reason.setInvalid(true); return; }
             agentOrchestrator.rejectRun(runId, reason.getValue());
             try {
-                // Use findAllByModuleIdWithReportAndRun to load report relationship
                 List<AgentRun> runs = agentRunRepository.findAllByModuleIdWithReportAndRun(moduleId);
                 runs.stream().filter(r -> r.getId().equals(runId)).findFirst()
-                        .ifPresent(this::refreshReportPane);
+                        .ifPresent(run -> {
+                            refreshReportPane(run);
+                            RowRefs refs = rowMap.get(run.getAgentName());
+                            if (refs != null) updateRowFromRun(refs, run);
+                            lastPolledStatus.put(run.getAgentName(), run.getStatus());
+                            updateSummaryBadges(runs);
+                        });
             } catch (Exception ignored) {}
             dialog.close();
             Notification.show("Run rejected", 3000, Notification.Position.BOTTOM_CENTER)
@@ -1062,9 +1478,14 @@ public class AgentMonitorView extends VerticalLayout implements BeforeEnterObser
      */
     private void reRunPipeline() {
         Module module = moduleService.findByIdWithDetails(moduleId);
-        com.aidevplatform.domain.enums.ModuleStatus status = module.getStatus();
-        if (status == com.aidevplatform.domain.enums.ModuleStatus.DRAFT) {
-            Notification.show("Cannot re-run a DRAFT module",
+        if (module.getRawRequirement() == null || module.getRawRequirement().isBlank()) {
+            Notification.show("Module has no requirement set — upload a requirement first",
+                    3000, Notification.Position.BOTTOM_CENTER)
+                    .addThemeVariants(NotificationVariant.LUMO_ERROR);
+            return;
+        }
+        if (module.getWorkflowId() == null) {
+            Notification.show("No workflow assigned — assign a workflow first",
                     3000, Notification.Position.BOTTOM_CENTER)
                     .addThemeVariants(NotificationVariant.LUMO_ERROR);
             return;

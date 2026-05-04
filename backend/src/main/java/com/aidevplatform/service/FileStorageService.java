@@ -100,6 +100,32 @@ public class FileStorageService {
         }
     }
 
+    /**
+     * Overwrites the content of an existing output file (absolute or relative path).
+     */
+    public void saveContent(String path, String content) {
+        if (LOCAL.equalsIgnoreCase(storageType)) {
+            try {
+                Path target = Paths.get(path).isAbsolute()
+                        ? Paths.get(path)
+                        : resolveLocalPath(path);
+                Files.createDirectories(target.getParent());
+                Files.writeString(target, content, StandardCharsets.UTF_8);
+                log.info("File saved locally: {}", target.toAbsolutePath());
+            } catch (IOException e) {
+                log.error("Failed to save file: {}", path, e);
+                throw new RuntimeException("File save failed: " + e.getMessage(), e);
+            }
+        } else {
+            byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+            try (var bais = new ByteArrayInputStream(bytes)) {
+                uploadToMinio(path, bais, "text/plain", bytes.length);
+            } catch (IOException e) {
+                throw new RuntimeException("MinIO save failed: " + e.getMessage(), e);
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Local filesystem storage
     // -------------------------------------------------------------------------

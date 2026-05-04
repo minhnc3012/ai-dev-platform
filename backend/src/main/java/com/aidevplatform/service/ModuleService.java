@@ -92,21 +92,20 @@ public class ModuleService {
     public void triggerAgentRun(UUID moduleId) {
         Module module = findById(moduleId);
         if (module.getRawRequirement() == null || module.getRawRequirement().isBlank()) {
-            throw new IllegalStateException("Module has no requirement to process: " + moduleId);
+            throw new IllegalStateException("Module has no requirement set");
         }
         if (module.getProject().getAiConfig() == null) {
-            throw new IllegalStateException("Project has no AI config configured: " +
-                    module.getProject().getId());
+            throw new IllegalStateException("Project has no AI configuration");
         }
-        // Guard against double-trigger from the UI (e.g. two rapid clicks)
+        if (module.getWorkflowId() == null) {
+            throw new IllegalStateException("No workflow assigned — assign a workflow before running");
+        }
         if (module.getStatus() != ModuleStatus.DRAFT && module.getStatus() != ModuleStatus.FAILED) {
             throw new IllegalStateException(
                     "Pipeline already running or completed (status=" + module.getStatus() + ")");
         }
         module.setStatus(ModuleStatus.PENDING_RUN);
         moduleRepository.save(module);
-
-        // Delegate to async orchestrator
         agentOrchestrator.runAgentPipeline(moduleId);
         log.info("Agent run triggered for module: {}", moduleId);
     }
@@ -128,45 +127,22 @@ public class ModuleService {
                 .orElseThrow(() -> new EntityNotFoundException("Module not found: " + moduleId));
         log.info("Stopping and resetting pipeline for module {}, found {} agent runs", moduleId, allRuns.size());
 
-        // 1. Terminate all RUNNING agents
-        for (AgentRun run : allRuns) {
-            if (run.getStatus() == AgentRunStatus.RUNNING) {
-                run.setStatus(AgentRunStatus.TERMINATED);
-                run.setErrorMessage("Manually stopped by user - reset for re-run");
-                agentRunRepository.save(run);
-                log.info("Marked run {} as TERMINATED for agent {}", run.getId(), run.getAgentName());
-            }
-        }
-
-        // 2. Reset ALL runs to PENDING (force complete re-run)
-        for (AgentRun run : allRuns) {
-            run.setStatus(AgentRunStatus.PENDING);
-            run.setStartedAt(null);
-            run.setCompletedAt(null);
-            run.setDurationSeconds(null);
-            run.setTokensUsed(0);
-            run.setRetryCount(0);
-            run.setErrorMessage(null);
-            agentRunRepository.save(run);
-            log.info("Reset run {} to PENDING for agent {}", run.getId(), run.getAgentName());
-        }
-
-        // 3. Clean up all reports for this module
+        // 1. Delete all existing runs and reports (workflow path creates fresh runs on restart)
         agentReportRepository.deleteByRunIdIn(allRuns.stream().map(AgentRun::getId).toList());
-        log.info("Deleted all reports for module {}", moduleId);
+        agentRunRepository.deleteAll(allRuns);
+        log.info("Deleted {} runs and all reports for module {}", allRuns.size(), moduleId);
 
-        // 4. Update module status
-        module.setStatus(ModuleStatus.PENDING_RUN);
+        // 2. Reset module to DRAFT so runAgentPipeline passes the status guard
+        module.setStatus(ModuleStatus.DRAFT);
         module.setCurrentAgent(null);
         moduleRepository.save(module);
 
-        // 5. Dispatch first agent
+        // 3. Start fresh pipeline
         try {
-            log.info("Triggering pipeline restart for module {}", moduleId);
             agentOrchestrator.runAgentPipeline(moduleId);
             log.info("Pipeline reset and restarted for module {}", moduleId);
         } catch (Exception e) {
-            log.error("Failed to trigger pipeline restart for module {}: {}", moduleId, e.getMessage(), e);
+            log.error("Failed to restart pipeline for module {}: {}", moduleId, e.getMessage(), e);
             throw e;
         }
     }

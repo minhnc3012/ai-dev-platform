@@ -127,6 +127,7 @@ public class ProjectSettingsView extends VerticalLayout implements BeforeEnterOb
         title.addClassNames(LumoUtility.FontWeight.SEMIBOLD, LumoUtility.FontSize.SMALL);
 
         String[][] providers = {
+                {"Claude CLI + local LLM", "CLI", "—", "claude --settings D:/Tools/local-llm.json --model qwen3.5:35b"},
                 {"LM Studio (local)", "API", "http://localhost:1234/v1", "qwen3.5-35b"},
                 {"Ollama server (local)", "API", "http://localhost:11434/v1", "qwen3.5:35b"},
                 {"Ollama CLI (local)", "CLI", "—", "ollama run qwen3.5:35b"},

@@ -103,7 +103,15 @@ public class ProjectDetailView extends VerticalLayout implements BeforeEnterObse
                 getUI().ifPresent(ui -> ui.navigate(ModuleManagerView.class, new RouteParameters("projectId", projectId.toString()))));
         modulesBtn.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
 
-        HorizontalLayout actions = new HorizontalLayout(settingsBtn, modulesBtn);
+        Button agentTemplatesBtn = new Button("Agent Templates", e ->
+                getUI().ifPresent(ui -> ui.navigate("projects/" + projectId + "/agent-templates")));
+        agentTemplatesBtn.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
+
+        Button workflowsBtn = new Button("Workflows", e ->
+                getUI().ifPresent(ui -> ui.navigate("projects/" + projectId + "/workflows")));
+        workflowsBtn.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
+
+        HorizontalLayout actions = new HorizontalLayout(settingsBtn, agentTemplatesBtn, workflowsBtn, modulesBtn);
         add(actions);
 
         // Modules section

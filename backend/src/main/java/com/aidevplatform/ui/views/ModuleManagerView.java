@@ -2,9 +2,13 @@ package com.aidevplatform.ui.views;
 
 import com.aidevplatform.domain.entity.Module;
 import com.aidevplatform.domain.entity.Project;
+import com.aidevplatform.domain.entity.WorkflowDefinition;
+import com.aidevplatform.repository.ModuleRepository;
 import com.aidevplatform.service.FileStorageService;
 import com.aidevplatform.service.ModuleService;
 import com.aidevplatform.service.ProjectService;
+import com.aidevplatform.service.WorkflowService;
+import com.vaadin.flow.component.combobox.ComboBox;
 import com.aidevplatform.ui.MainLayout;
 import com.aidevplatform.ui.components.FileUploadComponent;
 import jakarta.annotation.security.PermitAll;
@@ -61,13 +65,19 @@ public class ModuleManagerView extends VerticalLayout implements BeforeEnterObse
     private final ProjectService projectService;
     private final ModuleService moduleService;
     private final FileStorageService fileStorageService;
+    private final WorkflowService workflowService;
+    private final ModuleRepository moduleRepository;
 
     private UUID projectId;
     private final Grid<Module> grid = new Grid<>(Module.class, false);
 
     public ModuleManagerView(ProjectService projectService, ModuleService moduleService,
-                              FileStorageService fileStorageService) {
+                              FileStorageService fileStorageService,
+                              WorkflowService workflowService,
+                              ModuleRepository moduleRepository) {
         this.projectService = projectService;
+        this.workflowService = workflowService;
+        this.moduleRepository = moduleRepository;
         this.moduleService = moduleService;
         this.fileStorageService = fileStorageService;
         setPadding(true);
@@ -138,9 +148,24 @@ public class ModuleManagerView extends VerticalLayout implements BeforeEnterObse
             Button uploadBtn = new Button("Upload Req", e -> openUploadDialog(module));
             uploadBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY);
 
+            Button workflowBtn = new Button(
+                    module.getWorkflowId() != null ? "Workflow ✓" : "Set Workflow",
+                    e -> openWorkflowAssignDialog(module));
+            workflowBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY);
+            if (module.getWorkflowId() != null) {
+                workflowBtn.getStyle().set("color", "#27500A");
+            }
+
+            boolean canRun = module.getRawRequirement() != null && !module.getRawRequirement().isBlank()
+                    && module.getWorkflowId() != null;
             Button runBtn = new Button("Run Agents", e -> triggerAgentRun(module));
             runBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_SUCCESS);
-            runBtn.setEnabled(module.getRawRequirement() != null && !module.getRawRequirement().isBlank());
+            runBtn.setEnabled(canRun);
+            if (module.getRawRequirement() == null || module.getRawRequirement().isBlank()) {
+                runBtn.getElement().setAttribute("title", "Upload a requirement first");
+            } else if (module.getWorkflowId() == null) {
+                runBtn.getElement().setAttribute("title", "Assign a workflow first");
+            }
 
             Button monitorBtn = new Button("Monitor", e ->
                     getUI().ifPresent(ui -> ui.navigate(AgentMonitorView.class, new RouteParameters("moduleId", module.getId().toString()))));
@@ -149,7 +174,7 @@ public class ModuleManagerView extends VerticalLayout implements BeforeEnterObse
             Button deleteBtn = new Button("Delete", e -> confirmDelete(module));
             deleteBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_ERROR, ButtonVariant.LUMO_TERTIARY);
 
-            actions.add(uploadBtn, runBtn, monitorBtn, deleteBtn);
+            actions.add(uploadBtn, workflowBtn, runBtn, monitorBtn, deleteBtn);
             return actions;
         }).setHeader("Actions").setWidth("360px").setFlexGrow(0);
     }
@@ -329,5 +354,83 @@ public class ModuleManagerView extends VerticalLayout implements BeforeEnterObse
             }
         });
         confirm.open();
+    }
+
+    private void openWorkflowAssignDialog(Module module) {
+        Dialog dialog = new Dialog();
+        dialog.setHeaderTitle("Assign Workflow to: " + module.getName());
+        dialog.setWidth("480px");
+
+        List<WorkflowDefinition> workflows = workflowService.listByProject(projectId);
+
+        if (workflows.isEmpty()) {
+            VerticalLayout content = new VerticalLayout(
+                    new Paragraph("No workflows defined for this project yet."),
+                    new Paragraph("Go to Project → Workflows to create one first.")
+            );
+            content.setPadding(false);
+            Button closeBtn = new Button("Close", e -> dialog.close());
+            dialog.add(content, closeBtn);
+            dialog.open();
+            return;
+        }
+
+        ComboBox<WorkflowDefinition> workflowSelector = new ComboBox<>("Select Workflow");
+        workflowSelector.setItems(workflows);
+        workflowSelector.setItemLabelGenerator(WorkflowDefinition::getName);
+        workflowSelector.setWidthFull();
+        if (module.getWorkflowId() != null) {
+            workflows.stream()
+                    .filter(w -> w.getId().equals(module.getWorkflowId()))
+                    .findFirst()
+                    .ifPresent(workflowSelector::setValue);
+        }
+
+        Paragraph hint = new Paragraph(
+                "When a workflow is assigned, Run Agents will use the dynamic workflow instead of the default 5-agent pipeline.");
+        hint.getStyle().set("color", "#73726c").set("font-size", "0.85em");
+
+        VerticalLayout content = new VerticalLayout(workflowSelector, hint);
+        content.setPadding(false);
+
+        Button assignBtn = new Button("Assign", e -> {
+            WorkflowDefinition selected = workflowSelector.getValue();
+            Module m = moduleRepository.findById(module.getId()).orElse(null);
+            if (m != null) {
+                m.setWorkflowId(selected != null ? selected.getId() : null);
+                moduleRepository.save(m);
+            }
+            dialog.close();
+            refreshGrid();
+            Notification.show(selected != null
+                    ? "Workflow assigned: " + selected.getName()
+                    : "Workflow removed — using default pipeline")
+                    .addThemeVariants(NotificationVariant.LUMO_SUCCESS);
+        });
+        assignBtn.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+
+        Button removeBtn = new Button("Remove Workflow", e -> {
+            Module m = moduleRepository.findById(module.getId()).orElse(null);
+            if (m != null) {
+                m.setWorkflowId(null);
+                moduleRepository.save(m);
+            }
+            dialog.close();
+            refreshGrid();
+            Notification.show("Workflow removed — using default pipeline")
+                    .addThemeVariants(NotificationVariant.LUMO_SUCCESS);
+        });
+        removeBtn.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
+        removeBtn.setEnabled(module.getWorkflowId() != null);
+
+        Button cancelBtn = new Button("Cancel", e -> dialog.close());
+        cancelBtn.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
+
+        HorizontalLayout footer = new HorizontalLayout(cancelBtn, removeBtn, assignBtn);
+        footer.setJustifyContentMode(JustifyContentMode.END);
+        footer.setWidthFull();
+
+        dialog.add(content, footer);
+        dialog.open();
     }
 }

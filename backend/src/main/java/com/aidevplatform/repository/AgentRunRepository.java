@@ -39,6 +39,11 @@ public interface AgentRunRepository extends JpaRepository<AgentRun, UUID> {
             """)
     List<AgentRun> findStuckRuns(@Param("threshold") LocalDateTime threshold);
 
+    java.util.Optional<AgentRun> findByModuleIdAndStageId(UUID moduleId, String stageId);
+
+    @Query("SELECT COALESCE(MAX(r.runOrder), -1) FROM AgentRun r WHERE r.module.id = :moduleId")
+    int findMaxRunOrderByModuleId(@Param("moduleId") UUID moduleId);
+
     /**
      * Find all runs for a module with all relationships eagerly loaded.
      * Used by the monitor view to avoid LazyInitializationException.

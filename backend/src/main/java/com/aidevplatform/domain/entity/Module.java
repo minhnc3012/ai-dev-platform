@@ -6,6 +6,7 @@ import jakarta.persistence.*;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 import lombok.*;
+import lombok.Builder.Default;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -38,14 +39,20 @@ public class Module extends BaseEntity {
 
     @Column(columnDefinition = "jsonb")
     @JdbcTypeCode(SqlTypes.JSON)
+    @Default
     private List<UserStory> parsedStories = new ArrayList<>();
 
     @Enumerated(EnumType.STRING)
+    @Default
     private ModuleStatus status = ModuleStatus.DRAFT;
 
     private String currentAgent;
 
+    @Column(name = "workflow_id")
+    private java.util.UUID workflowId; // optional; null = legacy hardcoded flow
+
     @OneToMany(mappedBy = "module", cascade = CascadeType.ALL)
     @OrderBy("runOrder ASC")
+    @Default
     private List<AgentRun> agentRuns = new ArrayList<>();
 }

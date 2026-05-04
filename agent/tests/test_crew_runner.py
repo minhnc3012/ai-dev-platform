@@ -100,19 +100,22 @@ class TestParseResultToReport:
         report = _parse_result_to_report(result, "pm", {})
         assert report["summary"] == "Line one is the summary"
 
-    def test_next_agent_chain(self):
-        for agent, expected_next in [("pm", "architect"), ("architect", "dev"),
-                                      ("dev", "qa"), ("qa", "docs")]:
+    def test_next_steps_always_empty(self):
+        # Backend workflow orchestrator handles sequencing — next_steps is always []
+        for agent in ("pm", "architect", "dev", "qa", "docs", "coder", "reviewer"):
             report = _parse_result_to_report("summary", agent, {})
-            assert report["next_steps"][0]["agent"] == expected_next
+            assert report["next_steps"] == [], \
+                f"Expected next_steps == [] for agent '{agent}', got {report['next_steps']}"
 
     def test_no_next_step_for_docs(self):
+        # docs was previously the terminal node; now all agents return []
         report = _parse_result_to_report("summary", "docs", {})
         assert report["next_steps"] == []
 
-    def test_confidence_score_present(self):
+    def test_confidence_score_absent_in_fallback(self):
+        # Fallback parser does not emit confidence_score — agents must set it explicitly
         report = _parse_result_to_report("summary", "pm", {})
-        assert isinstance(report["confidence_score"], float)
+        assert "confidence_score" not in report
 
     def test_deliverable_uses_file_path(self, tmp_path):
         file_path = str(tmp_path / "pm_output.md")
@@ -154,7 +157,9 @@ class TestRunAgentPipelineRouting:
 # Agent definitions completeness check
 # ---------------------------------------------------------------------------
 
-class TestAgentDefinitions:
+# Legacy fallback definitions — kept for backward-compatibility with configs that
+# don't supply an agent_template.  New agents should always include agent_template.
+class TestLegacyAgentDefinitions:
     def test_all_agents_defined(self):
         for agent in ("pm", "architect", "dev", "qa", "docs"):
             assert agent in AGENT_DEFINITIONS

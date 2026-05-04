@@ -2,6 +2,7 @@ package com.aidevplatform.domain.entity;
 
 import jakarta.persistence.*;
 import lombok.*;
+import lombok.Builder.Default;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -27,8 +28,10 @@ public class User extends BaseEntity {
     private String passwordHash;
 
     @Column(nullable = false)
+    @Default
     private String role = "OWNER";
 
     @OneToMany(mappedBy = "owner", cascade = CascadeType.ALL)
+    @Default
     private List<Project> projects = new ArrayList<>();
 }

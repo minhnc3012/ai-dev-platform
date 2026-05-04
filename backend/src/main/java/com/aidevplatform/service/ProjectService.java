@@ -90,7 +90,7 @@ public class ProjectService {
             existing.setMaxTokensPerTask(config.getMaxTokensPerTask());
             existing.setOutputLanguage(config.getOutputLanguage());
             existing.setApprovalRequired(config.getApprovalRequired());
-            existing.setActiveAgents(config.getActiveAgents());
+            existing.setLlmCliSettingsFile(config.getLlmCliSettingsFile());
             existing.setTechStack(config.getTechStack());
             existing.setCodingStyleGuide(config.getCodingStyleGuide());
         }

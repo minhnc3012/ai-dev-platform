@@ -92,6 +92,60 @@ def _step_callback(step) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Dynamic agent helpers — resolve definition and build task description
+# ---------------------------------------------------------------------------
+
+def _resolve_agent_definition(task_config: dict) -> dict:
+    """Return effective agent definition — dynamic template or fallback to hardcoded."""
+    template = task_config.get("agent_template")
+    if template:
+        return {
+            "role": template.get("role", "AI Agent"),
+            "goal": template.get("goal", "Complete assigned tasks"),
+            "backstory_template": template.get("backstory_template")
+                                  or "You are a helpful AI agent. {context}",
+            "task_description_template": template.get("task_description_template"),
+        }
+    agent_name = task_config.get("agent_name", "pm")
+    # Fallback to hardcoded — populated below
+    print(f"[crew_runner] WARNING: no agent_template in task config for agent '{agent_name}' — using legacy fallback")
+    return None  # sentinel: caller falls back to AGENT_DEFINITIONS[agent_name]
+
+
+def _apply_chat_history(description: str, task_config: dict) -> str:
+    """Append owner chat feedback to the task description for revision runs."""
+    chat_history = task_config.get("chat_history", [])
+    if not chat_history:
+        return description
+    feedback_lines = [m["content"] for m in chat_history if m.get("role") == "user"]
+    if not feedback_lines:
+        return description
+    revision_block = "\n\n---\n## Revision Feedback from Owner:\n"
+    for line in feedback_lines:
+        revision_block += f"\n{line}\n"
+    revision_block += "\nPlease revise your output based on the feedback above."
+    return description + revision_block
+
+
+def _build_dynamic_task_description(task_config: dict, template_def: dict,
+                                     tree: list, file_contents: dict) -> str:
+    """Build task description from a user-defined template, with variable substitution."""
+    task_template = template_def.get("task_description_template")
+    requirement = task_config.get("raw_requirement", "")
+    previous_outputs = task_config.get("previousOutputs") or task_config.get("previous_outputs", {})
+    tech_stack = ", ".join(task_config.get("tech_stack", []))
+
+    desc = task_template
+    desc = desc.replace("{{requirement}}", requirement)
+    desc = desc.replace("{{tech_stack}}", tech_stack)
+    desc = desc.replace("{{previous_output}}", str(previous_outputs))
+    for agent_key, output in (previous_outputs.items() if isinstance(previous_outputs, dict) else {}.items()):
+        desc = desc.replace(f"{{{{previous_output.{agent_key}}}}}", str(output))
+
+    return _apply_chat_history(desc, task_config)
+
+
+# ---------------------------------------------------------------------------
 # Agent definitions
 # ---------------------------------------------------------------------------
 
@@ -295,23 +349,43 @@ def _run_cli_pipeline(task_config: dict) -> None:
         else:
             push_event(run_id, "INFO", "Workspace is empty — will create new project")
 
-        context = _build_project_context(task_config, tree, file_contents)
-        defn = AGENT_DEFINITIONS[agent_name]
-        backstory = defn["backstory_template"].format(context=context)
+        # For agents with a task_description_template (dynamic agents), the context
+        # embedded in the backstory only needs high-level info — skip file contents
+        # to keep the prompt small.
+        dyn_def = _resolve_agent_definition(task_config)
+        has_task_template = dyn_def is not None and bool(dyn_def.get("task_description_template"))
+        context = _build_project_context(
+            task_config,
+            tree,
+            {} if has_task_template else file_contents  # skip file contents in backstory when template handles it
+        )
+
+        if dyn_def is not None:
+            defn = dyn_def
+            backstory = defn["backstory_template"].format(context=context)
+            if defn.get("task_description_template"):
+                user_prompt = _build_dynamic_task_description(task_config, defn, tree, file_contents)
+            else:
+                task_fn = TASK_DESCRIPTIONS.get(agent_name, _task_pm)
+                user_prompt = _apply_chat_history(
+                    task_fn(task_config.get("raw_requirement", ""), tree, file_contents), task_config)
+        else:
+            defn = AGENT_DEFINITIONS.get(agent_name, AGENT_DEFINITIONS["pm"])
+            backstory = defn["backstory_template"].format(context=context)
+            task_fn = TASK_DESCRIPTIONS.get(agent_name, _task_pm)
+            user_prompt = _apply_chat_history(
+                task_fn(task_config.get("raw_requirement", ""), tree, file_contents), task_config)
 
         system_prompt = (
             f"You are a {defn['role']}.\n"
             f"Goal: {defn['goal']}\n\n"
             f"{backstory}"
         )
-        user_prompt = TASK_DESCRIPTIONS[agent_name](
-            task_config.get("raw_requirement", ""), tree, file_contents
-        )
         combined_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
 
         push_event(run_id, "THINKING", f"Calling CLI: {cli_command.split()[0]}...")
         print(f"[crew_runner] Spawning CLI: {cli_command.split()[0]} (this may take 30-90s)...")
-        raw_output = _execute_cli(cli_command, combined_prompt)
+        raw_output = _execute_cli(cli_command, combined_prompt, task_config)
         print(f"[crew_runner] CLI returned {len(raw_output)} chars")
 
         push_event(run_id, "THINKING", "CLI response received, writing output files...")
@@ -319,15 +393,10 @@ def _run_cli_pipeline(task_config: dict) -> None:
         if file_path:
             push_event(run_id, "INFO", f"Raw output written to: {file_path}")
 
-        source_files: list[str] = []
-        if agent_name == "dev":
-            source_files = _write_dev_source_files(raw_output, task_config)
-            if source_files:
-                for sf in source_files:
-                    push_event(run_id, "INFO", f"Source file created: {sf}")
-            else:
-                push_event(run_id, "WARNING",
-                           "Dev agent produced no <file path=...> blocks — check raw output")
+        source_files: list[str] = _write_source_files(raw_output, task_config)
+        if source_files:
+            for sf in source_files:
+                push_event(run_id, "INFO", f"Source file created: {sf}")
 
         report = _parse_result_to_report(raw_output, agent_name, task_config, file_path, source_files)
 
@@ -340,12 +409,32 @@ def _run_cli_pipeline(task_config: dict) -> None:
         raise
 
 
-def _execute_cli(cli_command: str, prompt: str) -> str:
+def _build_claude_command(cli_command: str, task_config: dict) -> list[str]:
+    """
+    Build the full claude CLI command from components.
+    - cli_command: base executable, e.g. "claude"
+    - llm_cli_settings_file: optional path to --settings JSON
+    - llm_model_name: model identifier
+
+    Result: ["claude", "--settings", "<path>", "--model", "<model>"]
+            or ["claude", "--model", "<model>"] when no settings file
+    """
+    parts = [cli_command.strip().split()[0]]  # just "claude"
+    settings_file = (task_config.get("llm_cli_settings_file") or "").strip()
+    model_name = (task_config.get("llm_model_name") or "").strip()
+    if settings_file:
+        parts += ["--settings", settings_file]
+    if model_name:
+        parts += ["--model", model_name]
+    return parts
+
+
+def _execute_cli(cli_command: str, prompt: str, task_config: dict | None = None) -> str:
     """
     Execute a CLI command with the prompt and return the output text.
 
     Supported tools:
-      claude -p        → prompt passed as CLI argument (Option 3 default)
+      claude  → --settings <file> --model <model> -p <prompt> (built from task_config)
       ollama run <m>   → prompt piped via stdin
       <other>          → prompt piped via stdin
     """
@@ -358,14 +447,43 @@ def _execute_cli(cli_command: str, prompt: str) -> str:
     _decode_kwargs = {"encoding": "utf-8", "errors": "replace"}
 
     if tool == "claude":
-        # claude -p "prompt" — Claude Code CLI, already authenticated
-        # Pass all flags from cli_command (e.g., --settings, --model) then append prompt.
-        # If user already included -p in parts, just append prompt; otherwise add -p first.
-        if "-p" in parts:
-            cmd = parts + [prompt]
+        # Read settings file and inject env vars directly — avoids --settings flag issues
+        # on Windows and ensures ANTHROPIC_BASE_URL redirects to the local LLM server.
+        import json, os as _os
+        env = _os.environ.copy()
+        settings_file = (task_config or {}).get("llm_cli_settings_file", "").strip()
+        if settings_file and _os.path.exists(settings_file):
+            try:
+                with open(settings_file, encoding="utf-8") as f:
+                    cfg = json.load(f)
+                env.update(cfg.get("env", {}))
+                print(f"[crew_runner] Loaded settings from: {settings_file}")
+            except Exception as e:
+                print(f"[crew_runner] WARNING: could not read settings file: {e}")
+
+        model_name = (task_config or {}).get("llm_model_name", "").strip()
+        cmd = [parts[0], "--dangerously-skip-permissions", "--print"]
+        if model_name:
+            cmd += ["--model", model_name]
+
+        print(f"[crew_runner] claude cmd: {' '.join(cmd)}")
+        print(f"[crew_runner] prompt length: {len(prompt)} chars")
+        # Pass prompt as -p argument — env vars keep the prompt short enough
+        # by removing workspace context from backstory (done in _run_cli_pipeline).
+        # If still too long, fall back to stdin via communicate().
+        if len(prompt) < 20000:
+            cmd += ["-p", prompt]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=600, env=env, **_decode_kwargs)
         else:
-            cmd = parts + ["-p", prompt]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, **_decode_kwargs)
+            # Very long prompt: pipe via stdin
+            print(f"[crew_runner] prompt >20k chars, using stdin pipe")
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=env, **_decode_kwargs)
+            stdout, stderr = proc.communicate(input=prompt, timeout=600)
+            result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
     elif tool == "ollama" and len(parts) >= 3 and parts[1] == "run":
         # ollama run <model> — pipe prompt via stdin
         result = subprocess.run(parts, input=prompt, capture_output=True, text=True, timeout=300, **_decode_kwargs)
@@ -373,14 +491,21 @@ def _execute_cli(cli_command: str, prompt: str) -> str:
         # Generic CLI tool — pipe prompt via stdin
         result = subprocess.run(parts, input=prompt, capture_output=True, text=True, timeout=300, **_decode_kwargs)
 
+    print(f"[crew_runner] exit={result.returncode} stdout={len(result.stdout)} stderr={len(result.stderr)}")
+    if result.stderr.strip():
+        print(f"[crew_runner] STDERR: {result.stderr[:1000]}")
+
     if result.returncode != 0:
         raise RuntimeError(
-            f"CLI error (exit {result.returncode}): {result.stderr[:500]}"
+            f"CLI error (exit {result.returncode}): {result.stderr[:800]}"
         )
 
     output = result.stdout.strip()
     if not output:
-        raise RuntimeError(f"CLI returned empty output (stderr: {result.stderr[:200]})")
+        raise RuntimeError(f"CLI returned empty output (stderr: {result.stderr[:500]})")
+
+    if output.lower().startswith("execution error") or "error:" in output[:200].lower():
+        print(f"[crew_runner] WARNING: output looks like an error: {output[:300]}")
 
     return output
 
@@ -405,7 +530,7 @@ def _run_crewai_pipeline(task_config: dict) -> None:
 
         llm = build_llm(task_config)
         context = _build_project_context(task_config, tree, file_contents)
-        agent = _build_agent(agent_name, llm, context, run_id)
+        agent = _build_agent(agent_name, llm, context, run_id, task_config)
         task = _build_task(agent_name, task_config, agent, tree, file_contents)
 
         crew = Crew(agents=[agent], tasks=[task], verbose=True)
@@ -416,15 +541,10 @@ def _run_crewai_pipeline(task_config: dict) -> None:
         if file_path:
             push_event(run_id, "INFO", f"Raw output written to: {file_path}")
 
-        source_files: list[str] = []
-        if agent_name == "dev":
-            source_files = _write_dev_source_files(raw_text, task_config)
-            if source_files:
-                for sf in source_files:
-                    push_event(run_id, "INFO", f"Source file created: {sf}")
-            else:
-                push_event(run_id, "WARNING",
-                           "Dev agent produced no <file path=...> blocks — check raw output")
+        source_files: list[str] = _write_source_files(raw_text, task_config)
+        if source_files:
+            for sf in source_files:
+                push_event(run_id, "INFO", f"Source file created: {sf}")
 
         report = _parse_result_to_report(result, agent_name, task_config, file_path, source_files)
         push_event(run_id, "COMPLETED", f"Agent '{agent_name}' completed successfully")
@@ -436,8 +556,13 @@ def _run_crewai_pipeline(task_config: dict) -> None:
         raise
 
 
-def _build_agent(agent_name: str, llm, project_context: str, run_id: str) -> Agent:
-    defn = AGENT_DEFINITIONS[agent_name]
+def _build_agent(agent_name: str, llm, project_context: str, run_id: str,
+                  task_config: dict | None = None) -> Agent:
+    dyn_def = _resolve_agent_definition(task_config or {}) if task_config else None
+    if dyn_def is not None:
+        defn = dyn_def
+    else:
+        defn = AGENT_DEFINITIONS.get(agent_name, AGENT_DEFINITIONS["pm"])
     backstory = defn["backstory_template"].format(context=project_context)
     _step_callback_local.run_id = run_id
     return Agent(
@@ -467,7 +592,14 @@ def _build_task(
     if tree is None or file_contents is None:
         tree, file_contents = _scan_workspace(config)
     requirement = config.get("raw_requirement", "")
-    description = TASK_DESCRIPTIONS[agent_name](requirement, tree, file_contents)
+
+    dyn_def = _resolve_agent_definition(config)
+    if dyn_def is not None and dyn_def.get("task_description_template"):
+        description = _build_dynamic_task_description(config, dyn_def, tree, file_contents)
+    else:
+        task_fn = TASK_DESCRIPTIONS.get(agent_name, _task_pm)
+        description = _apply_chat_history(task_fn(requirement, tree, file_contents), config)
+
     expected = _EXPECTED_OUTPUT.get(
         agent_name,
         "A structured markdown document with analysis, decisions, and findings"
@@ -493,8 +625,8 @@ _TEXT_EXTENSIONS = {
     '.json', '.xml', '.yaml', '.yml', '.toml', '.properties', '.gradle',
     '.sql', '.sh', '.bat', '.md', '.txt', '.html', '.css', '.scss',
 }
-_MAX_FILE_BYTES = 8_000   # truncate files larger than this
-_MAX_FILES_IN_CONTEXT = 40
+_MAX_FILE_BYTES = 3_000   # truncate files larger than this
+_MAX_FILES_IN_CONTEXT = 15
 
 
 def _scan_workspace(config: dict) -> tuple[list[str], dict[str, str]]:
@@ -552,7 +684,11 @@ def _scan_workspace(config: dict) -> tuple[list[str], dict[str, str]]:
     return tree, contents
 
 
-def _build_project_context(config: dict, tree: list[str], contents: dict[str, str]) -> str:
+def _build_project_context(config: dict, tree: list[str] | None = None, contents: dict[str, str] | None = None) -> str:
+    if tree is None:
+        tree = []
+    if contents is None:
+        contents = {}
     parts = [
         f"Tech stack: {', '.join(config.get('tech_stack', []))}",
         f"Output language for reports: {config.get('output_language', 'en')}",
@@ -608,9 +744,9 @@ def _write_output_to_workspace(content: str, agent_name: str, config: dict) -> s
     return str(out_file)
 
 
-def _write_dev_source_files(raw_output: str, config: dict) -> list[str]:
+def _write_source_files(raw_output: str, config: dict) -> list[str]:
     """
-    Parse every <file path="...">...</file> block in the dev agent's output
+    Parse every <file path="...">...</file> block in any agent's output
     and write each one as a real source file under the workspace root.
 
     Paths inside the tag are relative to workspace_path (the project root),
@@ -663,31 +799,22 @@ def _parse_result_to_report(
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
     summary = lines[0][:500] if lines else "No summary available"
 
-    next_agent_map = {"pm": "architect", "architect": "dev", "dev": "qa", "qa": "docs"}
-    next_agent = next_agent_map.get(agent_name)
-    next_steps = ([{"action": f"Pass output to {next_agent} agent",
-                    "agent": next_agent, "priority": "HIGH"}]
-                  if next_agent else [])
+    next_steps = []  # Backend workflow orchestrator handles sequencing
 
-    # For the dev agent: list each generated source file as its own deliverable.
-    # For other agents: list the single markdown output file.
-    if agent_name == "dev" and source_files:
+    # If any agent produced source files: list each as its own deliverable.
+    # Otherwise: list the single markdown output file.
+    if source_files:
         deliverables = [
             {
                 "type": "code",
                 "name": pathlib.Path(p).name,
                 "file_path": p,
-                "description": f"Source file generated by dev agent",
+                "description": f"Source file generated by {agent_name} agent",
                 "lines": len(pathlib.Path(p).read_text(encoding="utf-8").splitlines()),
             }
             for p in source_files
         ]
-        if not deliverables:
-            # Fallback: no <file> blocks found — report the raw output file
-            deliverables = [{"type": "doc", "name": "dev_output.md",
-                             "file_path": file_path or "/outputs/dev/dev_output.md",
-                             "description": "Dev agent raw output (no source files parsed)", "lines": len(lines)}]
-        summary = f"Dev agent created {len(source_files)} source file(s): " + \
+        summary = f"{agent_name} agent created {len(source_files)} source file(s): " + \
                   ", ".join(pathlib.Path(p).name for p in source_files)
     else:
         deliverable_path = file_path or f"/outputs/{agent_name}/{agent_name}_output.md"
@@ -701,7 +828,5 @@ def _parse_result_to_report(
         "issues_found": [],
         "next_steps": next_steps,
         "owner_decisions_needed": [],
-        "confidence_score": 75.0,
-        "confidence_reason": "Automated confidence estimate based on output completeness",
         "tokens_used": (result.token_usage.total_tokens if hasattr(result, "token_usage") and result.token_usage else 0),
     }

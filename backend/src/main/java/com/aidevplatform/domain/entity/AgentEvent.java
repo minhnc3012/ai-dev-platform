@@ -6,6 +6,7 @@ import jakarta.persistence.*;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 import lombok.*;
+import lombok.Builder.Default;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
@@ -35,5 +36,6 @@ public class AgentEvent extends BaseEntity {
     private ObjectNode payload;
 
     @Enumerated(EnumType.STRING)
+    @Default
     private EventSeverity severity = EventSeverity.INFO;
 }

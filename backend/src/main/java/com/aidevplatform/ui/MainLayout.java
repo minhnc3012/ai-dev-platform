@@ -65,6 +65,10 @@ public class MainLayout extends AppLayout {
         addToDrawer(nav);
     }
 
+    // Navigation to project-scoped views (Agent Templates, Workflow Builder)
+    // is handled via direct URL routing from project detail pages,
+    // not from the global sidebar (these views require a projectId parameter).
+
     private Span createIcon(String iconName) {
         Span icon = new Span();
         icon.addClassNames("la", "la-" + iconName);

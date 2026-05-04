@@ -61,7 +61,7 @@ class AgentOrchestratorTest {
     private AiConfig buildConfig(boolean approvalRequired, List<String> activeAgents) {
         AiConfig config = new AiConfig();
         config.setApprovalRequired(approvalRequired);
-        config.setActiveAgents(new ArrayList<>(activeAgents));
+        //config.setActiveAgents(new ArrayList<>(activeAgents));
         config.setInvocationMode(LlmInvocationMode.API);
         config.setLlmProvider("openai_compatible");
         config.setLlmBaseUrl("http://localhost:11434/v1");

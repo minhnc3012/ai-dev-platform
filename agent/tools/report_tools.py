@@ -12,7 +12,7 @@ def build_report(
     issues_found: list[dict] | None = None,
     next_steps: list[dict] | None = None,
     owner_decisions_needed: list[dict] | None = None,
-    confidence_score: float = 75.0,
+    confidence_score: float | None = None,
     confidence_reason: str = "",
     tokens_used: int = 0,
 ) -> dict:
@@ -25,16 +25,18 @@ def build_report(
     Returns:
         Report dict ready to pass to event_publisher.complete_run().
     """
-    return {
+    report = {
         "summary": summary,
         "deliverables": deliverables or [],
         "issues_found": issues_found or [],
         "next_steps": next_steps or [],
         "owner_decisions_needed": owner_decisions_needed or [],
-        "confidence_score": round(confidence_score, 2),
         "confidence_reason": confidence_reason,
         "tokens_used": tokens_used,
     }
+    if confidence_score is not None:
+        report["confidence_score"] = round(confidence_score, 2)
+    return report
 
 
 def make_deliverable(
